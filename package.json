@@ -1,0 +1,44 @@
+{
+  "author": "step-security",
+  "bugs": {
+    "url": "https://github.com/step-security/octokit-request-action/issues"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@octokit/action": "^8.0.0",
+    "axios": "^1.20.0",
+    "js-yaml": "^4.1.0"
+  },
+  "description": "A GitHub Action to send arbitrary requests to GitHub's REST API",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.2",
+    "@rollup/plugin-json": "^6.1.0",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "prettier": "3.8.1",
+    "rollup": "^4.59.0"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "homepage": "https://github.com/step-security/octokit-request-action",
+  "keywords": [
+    "github-action"
+  ],
+  "license": "MIT",
+  "main": "dist/index.js",
+  "name": "@step-security/octokit-request-action",
+  "private": true,
+  "publisher": "step-security",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/step-security/octokit-request-action.git"
+  },
+  "scripts": {
+    "build": "rollup --config rollup.config.js",
+    "lint": "prettier --check *.js **/*.{md,yml} package.json",
+    "lint:fix": "prettier --write *.js **/*.{md,yml} package.json"
+  },
+  "type": "module",
+  "version": "3.0.0"
+}
