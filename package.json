@@ -7,7 +7,7 @@
     "@actions/core": "^3.0.1",
     "@octokit/action": "^8.0.0",
     "axios": "^1.20.0",
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^5.4.2"
   },
   "description": "A GitHub Action to send arbitrary requests to GitHub's REST API",
   "devDependencies": {
