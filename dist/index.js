@@ -5552,11 +5552,77 @@ function requireRequest$3 () {
 	    }
 	  }
 
-	  onUpgrade (statusCode, headers, socket) {
+	  /**
+	   * @param {number|null} statusCode
+	   * @param {Buffer[]|null} headers
+	   * @param {import('node:stream').Duplex} socket
+	   * @param {string} [statusText]
+	   */
+	  onUpgrade (statusCode, headers, socket, statusText = '') {
+	    this.onFinally();
+
 	    assert(!this.aborted);
 	    assert(!this.completed);
 
-	    return this[kHandler].onUpgrade(statusCode, headers, socket)
+	    if (statusCode !== null) {
+	      this.#publishUpgradeHeaders(statusCode, headers, statusText);
+	    }
+
+	    const result = this[kHandler].onUpgrade(statusCode, headers, socket);
+
+	    if (!this.aborted) {
+	      this.completed = true;
+	      if (statusCode !== null) {
+	        this.#publishUpgradeTrailers();
+	      }
+	    }
+
+	    return result
+	  }
+
+	  /**
+	   * @param {number} statusCode
+	   * @param {import('node:http2').IncomingHttpHeaders} headers
+	   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+	   * @param {string} [statusText]
+	   */
+	  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+	    assert(!this.aborted);
+	    assert(this.completed);
+
+	    if (channels.headers.hasSubscribers) {
+	      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText);
+	    }
+	    this.#publishUpgradeTrailers();
+	  }
+
+	  /**
+	   * @param {Error} error
+	   */
+	  onUpgradeError (error) {
+	    assert(!this.aborted);
+	    assert(this.completed);
+
+	    if (channels.error.hasSubscribers) {
+	      channels.error.publish({ request: this, error });
+	    }
+	  }
+
+	  /**
+	   * @param {number} statusCode
+	   * @param {Buffer[]} headers
+	   * @param {string} statusText
+	   */
+	  #publishUpgradeHeaders (statusCode, headers, statusText) {
+	    if (channels.headers.hasSubscribers) {
+	      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } });
+	    }
+	  }
+
+	  #publishUpgradeTrailers () {
+	    if (channels.trailers.hasSubscribers) {
+	      channels.trailers.publish({ request: this, trailers: [] });
+	    }
 	  }
 
 	  onComplete (trailers) {
@@ -5786,6 +5852,7 @@ function requireDispatcherBase$1 () {
 	if (hasRequiredDispatcherBase$1) return dispatcherBase$1;
 	hasRequiredDispatcherBase$1 = 1;
 
+	const buffer = require$$0$1;
 	const Dispatcher = requireDispatcher$1();
 	const {
 	  ClientDestroyedError,
@@ -5798,6 +5865,7 @@ function requireDispatcherBase$1 () {
 	const kOnClosed = Symbol('onClosed');
 	const kInterceptedDispatch = Symbol('Intercepted Dispatch');
 	const kWebSocketOptions = Symbol('webSocketOptions');
+	const kEventSourceOptions = Symbol('eventSourceOptions');
 
 	class DispatcherBase extends Dispatcher {
 	  constructor (opts) {
@@ -5808,12 +5876,19 @@ function requireDispatcherBase$1 () {
 	    this[kClosed] = false;
 	    this[kOnClosed] = [];
 	    this[kWebSocketOptions] = opts?.webSocket ?? {};
+	    this[kEventSourceOptions] = opts?.eventSource ?? {};
 	  }
 
 	  get webSocketOptions () {
 	    return {
 	      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
 	      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+	    }
+	  }
+
+	  get eventSourceOptions () {
+	    return {
+	      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
 	    }
 	  }
 
@@ -12139,7 +12214,7 @@ function requireClientH1$1 () {
 	  }
 
 	  onUpgrade (head) {
-	    const { upgrade, client, socket, headers, statusCode } = this;
+	    const { upgrade, client, socket, headers, statusCode, statusText } = this;
 
 	    assert(upgrade);
 	    assert(client[kSocket] === socket);
@@ -12174,9 +12249,10 @@ function requireClientH1$1 () {
 	    client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'));
 
 	    try {
-	      request.onUpgrade(statusCode, headers, socket);
-	    } catch (err) {
-	      util.destroy(socket, err);
+	      request.onUpgrade(statusCode, headers, socket, statusText);
+	    } catch (error) {
+	      util.errorRequest(client, request, error);
+	      util.destroy(socket, error);
 	    }
 
 	    client[kResume]();
@@ -12433,8 +12509,6 @@ function requireClientH1$1 () {
 	  socket[kParser] = new Parser(client, socket, llhttpInstance);
 
 	  addListener(socket, 'error', function (err) {
-	    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	    const parser = this[kParser];
 
 	    // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -12757,12 +12831,22 @@ function requireClientH1$1 () {
 	  const socket = client[kSocket];
 	  clearIdleSocketValidation(socket);
 
-	  const abort = (err) => {
-	    if (request.aborted || request.completed) {
+	  /**
+	   * @param {Error} [error]
+	   */
+	  const abort = (error) => {
+	    if (request.aborted) {
 	      return
 	    }
 
-	    util.errorRequest(client, request, err || new RequestAbortedError());
+	    if (request.completed) {
+	      if (request.upgrade || request.method === 'CONNECT') {
+	        util.destroy(socket, new InformationalError('aborted'));
+	      }
+	      return
+	    }
+
+	    util.errorRequest(client, request, error || new RequestAbortedError());
 
 	    util.destroy(body);
 	    util.destroy(socket, new InformationalError('aborted'));
@@ -13220,6 +13304,7 @@ function requireClientH2$1 () {
 	hasRequiredClientH2$1 = 1;
 
 	const assert = require$$0$3;
+	const { errorMonitor } = require$$0$2;
 	const { pipeline } = require$$0$4;
 	const util = requireUtil$d();
 	const {
@@ -13296,6 +13381,15 @@ function requireClientH2$1 () {
 	  return result
 	}
 
+	/**
+	 * @param {import('node:http2').IncomingHttpHeaders} headers
+	 * @returns {Buffer[]}
+	 */
+	function parseH2ResponseHeaders (headers) {
+	  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers;
+	  return parseH2Headers(realHeaders)
+	}
+
 	async function connectH2 (client, socket) {
 	  client[kSocket] = socket;
 
@@ -13345,8 +13439,6 @@ function requireClientH2$1 () {
 	  socket[kHTTP2Session] = session;
 
 	  util.addListener(socket, 'error', function (err) {
-	    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	    this[kError] = err;
 
 	    this[kClient][kOnError](err);
@@ -13420,8 +13512,6 @@ function requireClientH2$1 () {
 	}
 
 	function onHttp2SessionError (err) {
-	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	  this[kSocket][kError] = err;
 	  this[kClient][kOnError](err);
 	}
@@ -13516,22 +13606,32 @@ function requireClientH2$1 () {
 	  headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`;
 	  headers[HTTP2_HEADER_METHOD] = method;
 
-	  const abort = (err) => {
-	    if (request.aborted || request.completed) {
+	  /**
+	   * @param {Error} [error]
+	   */
+	  const abort = (error) => {
+	    if (request.aborted) {
 	      return
 	    }
 
-	    err = err || new RequestAbortedError();
+	    if (request.completed) {
+	      if (method === 'CONNECT' && stream != null) {
+	        util.destroy(stream, error || new RequestAbortedError());
+	      }
+	      return
+	    }
 
-	    util.errorRequest(client, request, err);
+	    error = error || new RequestAbortedError();
+
+	    util.errorRequest(client, request, error);
 
 	    if (stream != null) {
-	      util.destroy(stream, err);
+	      util.destroy(stream, error);
 	    }
 
 	    // We do not destroy the socket as we can continue using the session
 	    // the stream get's destroyed and the session remains to create new streams
-	    util.destroy(body, err);
+	    util.destroy(body, error);
 	    client[kQueue][client[kRunningIdx]++] = null;
 	    client[kResume]();
 	  };
@@ -13550,25 +13650,57 @@ function requireClientH2$1 () {
 
 	  if (method === 'CONNECT') {
 	    session.ref();
-	    // We are already connected, streams are pending, first request
-	    // will create a new stream. We trigger a request to create the stream and wait until
-	    // `ready` event is triggered
 	    // We disabled endStream to allow the user to write to the stream
 	    stream = session.request(headers, { endStream: false, signal });
+	    let upgradeResponseFinished = false;
 
-	    if (stream.id && !stream.pending) {
-	      request.onUpgrade(null, null, stream);
-	      ++session[kOpenStreams];
-	      client[kQueue][client[kRunningIdx]++] = null;
-	    } else {
-	      stream.once('ready', () => {
+	    /**
+	     * @param {import('node:http2').IncomingHttpHeaders} headers
+	     */
+	    const onResponse = (headers) => {
+	      upgradeResponseFinished = true;
+	      stream.off(errorMonitor, onUpgradeError);
+	      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders);
+	    };
+
+	    /**
+	     * @param {Error} error
+	     */
+	    const onUpgradeError = (error) => {
+	      upgradeResponseFinished = true;
+	      stream.off('response', onResponse);
+	      request.onUpgradeError(error);
+	    };
+
+	    const onReady = () => {
+	      try {
 	        request.onUpgrade(null, null, stream);
-	        ++session[kOpenStreams];
-	        client[kQueue][client[kRunningIdx]++] = null;
-	      });
-	    }
+	      } catch (error) {
+	        stream.off('response', onResponse);
+	        abort(error);
+	        return
+	      }
+
+	      if (request.aborted) {
+	        return
+	      }
+
+	      stream.off('error', abort);
+	      stream.once(errorMonitor, onUpgradeError);
+	      client[kQueue][client[kRunningIdx]++] = null;
+	    };
+
+	    stream.once('response', onResponse);
+	    stream.once('error', abort);
+	    ++session[kOpenStreams];
+	    onReady();
 
 	    stream.once('close', () => {
+	      if (!upgradeResponseFinished && request.completed) {
+	        stream.off('response', onResponse);
+	        stream.off(errorMonitor, onUpgradeError);
+	        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`));
+	      }
 	      session[kOpenStreams] -= 1;
 	      if (session[kOpenStreams] === 0) session.unref();
 	    });
@@ -14327,9 +14459,10 @@ function requireClient$1 () {
 	    // h2
 	    maxConcurrentStreams,
 	    allowH2,
-	    webSocket
+	    webSocket,
+	    eventSource
 	  } = {}) {
-	    super({ webSocket });
+	    super({ webSocket, eventSource });
 
 	    if (keepAlive !== undefined) {
 	      throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -15574,7 +15707,7 @@ function requireAgent$2 () {
 	}
 
 	class Agent extends DispatcherBase {
-	  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+	  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
 	    if (typeof factory !== 'function') {
 	      throw new InvalidArgumentError('factory must be a function.')
 	    }
@@ -15593,11 +15726,15 @@ function requireAgent$2 () {
 	      connect = { ...connect };
 	    }
 
+	    if (tls && typeof tls !== 'function') {
+	      tls = { ...tls };
+	    }
+
 	    this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
 	      ? options.interceptors.Agent
 	      : [createRedirectInterceptor({ maxRedirections })];
 
-	    this[kOptions] = { ...util.deepClone(options), connect };
+	    this[kOptions] = { ...util.deepClone(options), connect, tls };
 	    this[kOptions].interceptors = options.interceptors
 	      ? { ...options.interceptors }
 	      : undefined;
@@ -16343,7 +16480,10 @@ function requireRetryHandler$1 () {
 	    this.retryCount += 1;
 
 	    if (statusCode >= 300) {
-	      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+	      // Only expose a response if no earlier attempt has reached the caller.
+	      // Otherwise abort this attempt so the error settles the existing body
+	      // instead of replacing it with a new response.
+	      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
 	        this.headersSent = true;
 	        this.checkpointResponseEnd(headers, resume);
 	        return this.handler.onHeaders(
@@ -24137,8 +24277,10 @@ function requireFetch$1 () {
 	  // 19. Run these steps in parallel:
 
 	  //    1. Run these steps, but abort when fetchParams is canceled:
-	  fetchParams.controller.onAborted = onAborted;
-	  fetchParams.controller.on('terminated', onAborted);
+	  if (!fetchParams.controller.resume) {
+	    fetchParams.controller.on('terminated', onAborted);
+	  }
+
 	  fetchParams.controller.resume = async () => {
 	    // 1. While true
 	    while (true) {
@@ -24307,8 +24449,6 @@ function requireFetch$1 () {
 	          }
 	          location = headersList.get('location', true);
 
-	          this.body = new Readable({ read: resume });
-
 	          const decoders = [];
 
 	          const willFollow = location && request.redirect === 'follow' &&
@@ -24326,7 +24466,7 @@ function requireFetch$1 () {
 	            // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
 	            const maxContentEncodings = 5;
 	            if (codings.length > maxContentEncodings) {
-	              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
+	              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
 	              return true
 	            }
 
@@ -24358,6 +24498,8 @@ function requireFetch$1 () {
 	              }
 	            }
 	          }
+
+	          this.body = new Readable({ read: resume });
 
 	          const onError = this.onError.bind(this);
 
@@ -24403,10 +24545,6 @@ function requireFetch$1 () {
 	        onComplete () {
 	          if (this.abort) {
 	            fetchParams.controller.off('terminated', this.abort);
-	          }
-
-	          if (fetchParams.controller.onAborted) {
-	            fetchParams.controller.off('terminated', fetchParams.controller.onAborted);
 	          }
 
 	          fetchParams.controller.ended = true;
@@ -29206,6 +29344,20 @@ function requireReceiver$1 () {
 	        if (isControlFrame(this.#info.opcode)) {
 	          this.#loop = this.parseControlFrame(body);
 	          this.#state = parserStates.INFO;
+
+	          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+	          // stop parsing and resume on drain so a PING flood cannot grow the
+	          // outbound queue without bound.
+	          const socket = this.ws[kResponse].socket;
+	          if (this.#loop && socket.writableNeedDrain) {
+	            this.#loop = false;
+	            socket.once('drain', () => {
+	              if (this.destroyed) return
+	              this.#loop = true;
+	              this.run(callback);
+	            });
+	            return
+	          }
 	        } else {
 	          if (!this.#info.compressed) {
 	            if (!this.writeFragments(body)) {
@@ -30237,6 +30389,7 @@ var hasRequiredEventsourceStream$1;
 function requireEventsourceStream$1 () {
 	if (hasRequiredEventsourceStream$1) return eventsourceStream$1;
 	hasRequiredEventsourceStream$1 = 1;
+	const buffer = require$$0$1;
 	const { Transform } = require$$0$4;
 	const { isASCIINumber, isValidLastEventId } = requireUtil$6();
 
@@ -30261,10 +30414,18 @@ function requireEventsourceStream$1 () {
 	 */
 	const SPACE = 0x20;
 
+	const defaultMaxEventSize = buffer.kStringMaxLength;
+
 	const DATA = Buffer.from('data');
 	const EVENT = Buffer.from('event');
 	const ID = Buffer.from('id');
 	const RETRY = Buffer.from('retry');
+
+	// Each data field creates a string node, and each unconsumed input chunk keeps
+	// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+	const minParserItems = 1024;
+	const maxParserItems = 131072;
+	const bytesPerParserItem = 128;
 
 	function isASCIINumberBytes (buffer, start) {
 	  if (start >= buffer.length) {
@@ -30302,6 +30463,12 @@ function requireEventsourceStream$1 () {
 	  }
 
 	  return true
+	}
+
+	function createMaxEventSizeExceededError () {
+	  const error = new Error('EventSource message size exceeded');
+	  error.aborted = false;
+	  return error
 	}
 
 	/**
@@ -30352,6 +30519,13 @@ function requireEventsourceStream$1 () {
 	  pos = 0
 	  lineChunkIndex = 0
 	  linePos = 0
+	  lineLength = 0
+	  eventSize = 0
+	  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+	  dataLineCount = 0
+	  maxEventSize
+	  maxDataLines
+	  maxBufferedChunks
 
 	  event = {
 	    data: undefined,
@@ -30362,6 +30536,7 @@ function requireEventsourceStream$1 () {
 
 	  /**
 	   * @param {object} options
+	   * @param {number} [options.maxEventSize]
 	   * @param {eventSourceSettings} options.eventSourceSettings
 	   * @param {Function} [options.push]
 	   */
@@ -30373,6 +30548,12 @@ function requireEventsourceStream$1 () {
 	    super(options);
 
 	    this.state = options.eventSourceSettings || {};
+	    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize;
+	    const parserItemLimit = this.maxEventSize > 0
+	      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+	      : 0;
+	    this.maxDataLines = parserItemLimit;
+	    this.maxBufferedChunks = parserItemLimit;
 	    if (options.push) {
 	      this.push = options.push;
 	    }
@@ -30390,6 +30571,14 @@ function requireEventsourceStream$1 () {
 	      return
 	    }
 
+	    // A leading line ending can immediately release the currently buffered
+	    // line, even when it uses the final allowed chunk slot.
+	    if (this.maxEventSize > 0 &&
+	        this.chunks.length >= this.maxBufferedChunks &&
+	        chunk[0] !== LF && chunk[0] !== CR) {
+	      callback(createMaxEventSizeExceededError());
+	      return
+	    }
 	    this.chunks.push(chunk);
 
 	    // Strip leading byte-order-mark if we opened the stream and started
@@ -30468,7 +30657,12 @@ function requireEventsourceStream$1 () {
 
 	        // In any case, we can process the line as we reached an
 	        // end-of-line character
-	        this.parseLine(this.readLine(), this.event);
+	        try {
+	          this.parseLine(this.readLine(), this.event);
+	        } catch (error) {
+	          callback(error);
+	          return
+	        }
 	        this.consumeCurrentByte();
 	        // A line was processed and this could be the end of the event. We need
 	        // to check if the next line is empty to determine if the event is
@@ -30477,15 +30671,28 @@ function requireEventsourceStream$1 () {
 	        continue
 	      }
 
+	      // readLine() is only called after CR or LF. Reject an unfinished line
+	      // before it can retain an unbounded number of decoded chunks. The seven
+	      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+	      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+	        callback(createMaxEventSizeExceededError());
+	        return
+	      }
 	      this.advanceCursor();
 	    }
 
 	    callback();
 	  }
 
+	  _destroy (error, callback) {
+	    this.chunks.length = 0;
+	    this.clearEvent();
+	    super._destroy(error, callback);
+	  }
+
 	  /**
 	   * @param {Buffer} line
-	   * @param {EventStreamEvent} event
+	   * @param {EventSourceStreamEvent} event
 	   */
 	  parseLine (line, event) {
 	    // If the line is empty (a blank line)
@@ -30519,6 +30726,13 @@ function requireEventsourceStream$1 () {
 	    }
 
 	    if (isFieldName(line, fieldLength, DATA)) {
+	      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+	        throw createMaxEventSizeExceededError()
+	      }
+	      const valueBytes = line.length - valueStart;
+	      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes;
+	      this.setEventFieldSize('data', dataSize);
+
 	      const value = line.toString('utf8', valueStart);
 
 	      if (event.data === undefined) {
@@ -30526,11 +30740,13 @@ function requireEventsourceStream$1 () {
 	      } else {
 	        event.data += `\n${value}`;
 	      }
+	      this.dataLineCount++;
 	      return
 	    }
 
 	    if (isFieldName(line, fieldLength, RETRY)) {
 	      if (isASCIINumberBytes(line, valueStart)) {
+	        this.setEventFieldSize('retry', line.length - valueStart);
 	        event.retry = line.toString('utf8', valueStart);
 	      }
 	      return
@@ -30538,18 +30754,27 @@ function requireEventsourceStream$1 () {
 
 	    if (isFieldName(line, fieldLength, ID)) {
 	      if (isValidLastEventIdBytes(line, valueStart)) {
+	        this.setEventFieldSize('id', line.length - valueStart);
 	        event.id = line.toString('utf8', valueStart);
 	      }
 	      return
 	    }
 
 	    if (isFieldName(line, fieldLength, EVENT)) {
-	      const value = line.toString('utf8', valueStart);
-
-	      if (value.length > 0) {
-	        event.event = value;
+	      if (valueStart < line.length) {
+	        this.setEventFieldSize('event', line.length - valueStart);
+	        event.event = line.toString('utf8', valueStart);
 	      }
 	    }
+	  }
+
+	  setEventFieldSize (field, size) {
+	    const eventSize = this.eventSize - this.eventFieldSizes[field] + size;
+	    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+	      throw createMaxEventSizeExceededError()
+	    }
+	    this.eventSize = eventSize;
+	    this.eventFieldSizes[field] = size;
 	  }
 
 	  /**
@@ -30582,6 +30807,12 @@ function requireEventsourceStream$1 () {
 	    this.event.event = undefined;
 	    this.event.id = undefined;
 	    this.event.retry = undefined;
+	    this.eventSize = 0;
+	    this.dataLineCount = 0;
+	    this.eventFieldSizes.data = 0;
+	    this.eventFieldSizes.event = 0;
+	    this.eventFieldSizes.id = 0;
+	    this.eventFieldSizes.retry = 0;
 	  }
 
 	  hasPendingEvent () {
@@ -30617,14 +30848,16 @@ function requireEventsourceStream$1 () {
 	  syncLineStartToCursor () {
 	    this.lineChunkIndex = this.chunkIndex;
 	    this.linePos = this.pos;
+	    this.lineLength = 0;
 	    this.dropConsumedChunks();
 	  }
 
 	  dropConsumedChunks () {
-	    while (this.lineChunkIndex > 0) {
-	      this.chunks.shift();
-	      this.lineChunkIndex--;
-	      this.chunkIndex--;
+	    if (this.lineChunkIndex > 0) {
+	      const consumed = this.lineChunkIndex;
+	      this.chunks.splice(0, consumed);
+	      this.lineChunkIndex = 0;
+	      this.chunkIndex -= consumed;
 	    }
 
 	    if (this.chunkIndex === this.chunks.length) {
@@ -30750,6 +30983,7 @@ function requireEventsource$1 () {
 	const { delay } = requireUtil$6();
 	const { kEnumerableProperty } = requireUtil$d();
 	const { environmentSettingsObject } = requireUtil$c();
+	const { getGlobalDispatcher } = requireGlobal$2();
 
 	let experimentalWarned = false;
 
@@ -31031,6 +31265,7 @@ function requireEventsource$1 () {
 
 	      const eventSourceStream = new EventSourceStream({
 	        eventSourceSettings: this.#state,
+	        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
 	        push: (event) => {
 	          this.dispatchEvent(createFastMessageEvent(
 	            event.type,
@@ -31209,7 +31444,8 @@ function requireEventsource$1 () {
 	  },
 	  {
 	    key: 'dispatcher', // undici only
-	    converter: webidl.converters.any
+	    converter: webidl.converters.any,
+	    defaultValue: () => getGlobalDispatcher()
 	  }
 	]);
 
@@ -35616,6 +35852,7 @@ function requireSymbols () {
 	  kDestroy: Symbol('destroy'),
 	  kDispatch: Symbol('dispatch'),
 	  kUrl: Symbol('url'),
+	  kRedirectCacheControl: Symbol('redirect cache control'),
 	  kWriting: Symbol('writing'),
 	  kResuming: Symbol('resuming'),
 	  kQueue: Symbol('queue'),
@@ -37439,6 +37676,26 @@ function requireUtil$5 () {
 	}
 
 	/**
+	 * @param {Record<string, string | string[]>} headers
+	 * @returns {Buffer[]}
+	 */
+	function toRawHeaders (headers) {
+	  const rawHeaders = [];
+
+	  for (const [name, value] of Object.entries(headers)) {
+	    if (Array.isArray(value)) {
+	      for (const entry of value) {
+	        rawHeaders.push(Buffer.from(name, 'latin1'), Buffer.from(`${entry}`, 'latin1'));
+	      }
+	    } else {
+	      rawHeaders.push(Buffer.from(name, 'latin1'), Buffer.from(`${value}`, 'latin1'));
+	    }
+	  }
+
+	  return rawHeaders
+	}
+
+	/**
 	 * @param {string[]} headers
 	 * @param {Buffer[]} headers
 	 */
@@ -37892,6 +38149,7 @@ function requireUtil$5 () {
 	  removeAllListeners,
 	  errorRequest,
 	  parseRawHeaders,
+	  toRawHeaders,
 	  encodeRawHeaders,
 	  parseHeaders,
 	  parseKeepAliveTimeout,
@@ -38329,7 +38587,7 @@ function requireRequest$1 () {
 
 	    this.method = method;
 
-	    this.typeOfService = typeOfService ?? 0;
+	    this.typeOfService = typeOfService;
 
 	    this.abort = null;
 
@@ -38508,11 +38766,32 @@ function requireRequest$1 () {
 	    }
 	  }
 
-	  onUpgrade (statusCode, headers, socket) {
+	  /**
+	   * @param {number} statusCode
+	   * @param {Buffer[]|string[]} headers
+	   * @param {import('node:stream').Duplex} socket
+	   * @param {string} [statusText]
+	   */
+	  onUpgrade (statusCode, headers, socket, statusText = '') {
+	    this.onFinally();
+
 	    assert(!this.aborted);
 	    assert(!this.completed);
 
-	    return this[kHandler].onUpgrade(statusCode, headers, socket)
+	    if (channels.headers.hasSubscribers) {
+	      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } });
+	    }
+
+	    const result = this[kHandler].onUpgrade(statusCode, headers, socket);
+
+	    if (!this.aborted) {
+	      this.completed = true;
+	      if (channels.trailers.hasSubscribers) {
+	        channels.trailers.publish({ request: this, trailers: [] });
+	      }
+	    }
+
+	    return result
 	  }
 
 	  onComplete (trailers) {
@@ -38961,6 +39240,7 @@ function requireDispatcherBase () {
 	if (hasRequiredDispatcherBase) return dispatcherBase;
 	hasRequiredDispatcherBase = 1;
 
+	const buffer = require$$0$1;
 	const Dispatcher = requireDispatcher();
 	const UnwrapHandler = requireUnwrapHandler();
 	const {
@@ -38973,6 +39253,7 @@ function requireDispatcherBase () {
 	const kOnDestroyed = Symbol('onDestroyed');
 	const kOnClosed = Symbol('onClosed');
 	const kWebSocketOptions = Symbol('webSocketOptions');
+	const kEventSourceOptions = Symbol('eventSourceOptions');
 
 	class DispatcherBase extends Dispatcher {
 	  /** @type {boolean} */
@@ -38993,6 +39274,7 @@ function requireDispatcherBase () {
 	  constructor (opts) {
 	    super();
 	    this[kWebSocketOptions] = opts?.webSocket ?? {};
+	    this[kEventSourceOptions] = opts?.eventSource ?? {};
 	  }
 
 	  /**
@@ -39002,6 +39284,15 @@ function requireDispatcherBase () {
 	    return {
 	      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
 	      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024 // 128 MB default
+	    }
+	  }
+
+	  /**
+	   * @returns {import('../../types/client').Client.EventSourceOptions}
+	   */
+	  get eventSourceOptions () {
+	    return {
+	      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
 	    }
 	  }
 
@@ -39194,16 +39485,22 @@ function requireConnect () {
 	    if (this._sessionCache.has(sessionKey)) {
 	      this._sessionCache.delete(sessionKey);
 	    } else if (this._sessionCache.size >= this._maxCachedSessions) {
+	      // Make room for the new session: prefer an entry whose session has
+	      // already been collected, otherwise evict the oldest one.
+	      let evicted = false;
 	      for (const [key, ref] of this._sessionCache) {
 	        if (ref.deref() === undefined) {
 	          this._sessionCache.delete(key);
-	          return
+	          evicted = true;
+	          break
 	        }
 	      }
 
-	      const oldest = this._sessionCache.keys().next();
-	      if (!oldest.done) {
-	        this._sessionCache.delete(oldest.value);
+	      if (!evicted) {
+	        const oldest = this._sessionCache.keys().next();
+	        if (!oldest.done) {
+	          this._sessionCache.delete(oldest.value);
+	        }
 	      }
 	    }
 
@@ -40213,6 +40510,19 @@ function requireInfra () {
 	}
 
 	const ASCII_WHITESPACE_REPLACE_REGEX = /[\u0009\u000A\u000C\u000D\u0020]/g; // eslint-disable-line no-control-regex
+	const nonASCIIRegex = /[^\x00-\x7F]/; // eslint-disable-line no-control-regex
+
+	/**
+	 * @param {string} str
+	 * @returns {string}
+	 *
+	 * @see https://infra.spec.whatwg.org/#ascii-lowercase
+	 */
+	function asciiLowercase (str) {
+	  return nonASCIIRegex.test(str)
+	    ? str.replace(/[A-Z]+/g, (upper) => upper.toLowerCase())
+	    : str.toLowerCase()
+	}
 
 	/**
 	 * @param {string} data
@@ -40377,6 +40687,7 @@ function requireInfra () {
 	}
 
 	infra = {
+	  asciiLowercase,
 	  collectASequenceOfCodePoints,
 	  collectASequenceOfCodePointsFast,
 	  forgivingBase64,
@@ -44618,7 +44929,6 @@ function requireBody () {
 	function extractBody (object, keepalive = false) {
 	  // 1. Let stream be null.
 	  let stream = null;
-	  let controller = null;
 
 	  // 2. If object is a ReadableStream object, then set stream to object.
 	  if (webidl.is.ReadableStream(object)) {
@@ -44631,11 +44941,44 @@ function requireBody () {
 	    // 4. Otherwise, set stream to a new ReadableStream object, and set
 	    //    up stream with byte reading support.
 	    stream = new ReadableStream({
-	      pull () {},
-	      start (c) {
-	        controller = c;
+	      start () {},
+	      async pull (controller) {
+	        // 19.1. Run action.
+	        const result = action();
+
+	        const iterator = result?.[Symbol.asyncIterator]?.();
+	        if (iterator == null) {
+	          // 19.2. Whenever one or more bytes are available and stream is not errored,
+	          // enqueue the result of creating a Uint8Array from the available bytes into stream.
+	          if (result?.length && !isErrored(stream)) {
+	            controller.enqueue(typeof result === 'string' ? textEncoder.encode(result) : new Uint8Array(result));
+	          }
+
+	          // 19.3. When running action is done, close stream.
+	          queueMicrotask(() => readableStreamClose(controller));
+	          return
+	        }
+
+	        while (true) {
+	          const { value, done } = await iterator.next();
+
+	          // 19.3. When running action is done, close stream.
+	          if (done) {
+	            queueMicrotask(() => readableStreamClose(controller));
+	            return
+	          }
+
+	          // 19.2. Whenever one or more bytes are available and stream is not errored,
+	          // enqueue the result of creating a Uint8Array from the available bytes into stream.
+	          if (value.length && !isErrored(stream)) {
+	            controller.enqueue(new Uint8Array(value));
+	            return
+	          }
+	        }
 	      },
-	      cancel () {},
+	      cancel (reason) {
+	        return action()[Symbol.asyncIterator]?.().return(reason)
+	      },
 	      type: 'bytes'
 	    });
 	  }
@@ -44734,7 +45077,7 @@ function requireBody () {
 	    // Set source to object.
 	    source = object;
 
-	    action = async function * () {
+	    const parts = (async function * () {
 	      for (const part of blobParts) {
 	        if (part.stream) {
 	          yield * part.stream();
@@ -44742,7 +45085,8 @@ function requireBody () {
 	          yield part;
 	        }
 	      }
-	    };
+	    })();
+	    action = () => parts;
 
 	    // Set type to `multipart/form-data; boundary=`,
 	    // followed by the multipart/form-data boundary string generated
@@ -44779,45 +45123,21 @@ function requireBody () {
 	      webidl.is.ReadableStream(object) ? object : ReadableStreamFrom(object);
 	  }
 
-	  // 11. If source is a byte sequence, then set action to a
+	  // 18. If source is a byte sequence, then set action to a
 	  // step that returns source and length to source’s length.
 	  if (typeof source === 'string' || isUint8Array(source)) {
-	    action = () => {
-	      length = typeof source === 'string' ? Buffer.byteLength(source) : source.length;
-	      return source
-	    };
+	    action = () => source;
+	    length = typeof source === 'string' ? Buffer.byteLength(source) : source.length;
 	  }
 
-	  // 12. If action is non-null, then run these steps in parallel:
-	  if (action != null) {
-(async () => {
-	      // 1. Run action.
-	      const result = action();
+	  // 19. If action is non-null, then run these steps in parallel:
+	  // Note: this is done in the pull method of the stream created above
 
-	      // 2. Whenever one or more bytes are available and stream is not errored,
-	      //    enqueue the result of creating a Uint8Array from the available bytes into stream.
-	      const iterator = result?.[Symbol.asyncIterator]?.();
-	      if (iterator) {
-	        for await (const bytes of iterator) {
-	          if (isErrored(stream)) break
-	          if (bytes.length) {
-	            controller.enqueue(new Uint8Array(bytes));
-	          }
-	        }
-	      } else if (result?.length && !isErrored(stream)) {
-	        controller.enqueue(typeof result === 'string' ? textEncoder.encode(result) : new Uint8Array(result));
-	      }
-
-	      // 3. When running action is done, close stream.
-	      queueMicrotask(() => readableStreamClose(controller));
-	    })();
-	  }
-
-	  // 13. Let body be a body whose stream is stream, source is source,
+	  // 20. Let body be a body whose stream is stream, source is source,
 	  // and length is length.
 	  const body = { stream, source, length };
 
-	  // 14. Return (body, type).
+	  // 21. Return (body, type).
 	  return [body, type]
 	}
 
@@ -45151,6 +45471,7 @@ function requireClientH1 () {
 	const kIdleSocketValidation = Symbol('kIdleSocketValidation');
 	const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout');
 	const kSocketUsed = Symbol('kSocketUsed');
+	const kTypeOfService = Symbol('kTypeOfService');
 
 	let extractBody;
 
@@ -45159,8 +45480,14 @@ function requireClientH1 () {
 
 	  let mod;
 
-	  // We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
-	  let useWasmSIMD = process.arch !== 'ppc64';
+	  // We disable wasm SIMD on older versions of Node.js on ppc64 that are broken on Power >=9 architectures.
+	  let useWasmSIMD = true;
+	  if (process.arch === 'ppc64') {
+	    const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10));
+	    if (major < 24 || (major === 24 && minor < 12)) {
+	      useWasmSIMD = false;
+	    }
+	  }
 	  // The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior
 	  if (process.env.UNDICI_NO_WASM_SIMD === '1') {
 	    useWasmSIMD = false;
@@ -45611,7 +45938,7 @@ function requireClientH1 () {
 	   * @param {Buffer} head
 	   */
 	  onUpgrade (head) {
-	    const { upgrade, client, socket, headers, statusCode } = this;
+	    const { upgrade, client, socket, headers, statusCode, statusText } = this;
 
 	    assert(upgrade);
 	    assert(client[kSocket] === socket);
@@ -45646,8 +45973,9 @@ function requireClientH1 () {
 	    client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'));
 
 	    try {
-	      request.onUpgrade(statusCode, headers, socket);
+	      request.onUpgrade(statusCode, headers, socket, statusText);
 	    } catch (err) {
+	      util.errorRequest(client, request, err);
 	      util.destroy(socket, err);
 	    }
 
@@ -46011,8 +46339,6 @@ function requireClientH1 () {
 	}
 
 	function onHttpSocketError (err) {
-	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	  const parser = this[kParser];
 
 	  // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -46194,6 +46520,32 @@ function requireClientH1 () {
 	  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && method !== 'TRACE' && method !== 'CONNECT'
 	}
 
+	function setTypeOfService (socket, request) {
+	  if (typeof socket.setTypeOfService !== 'function') {
+	    return
+	  }
+
+	  const typeOfService = request.typeOfService;
+
+	  if (typeOfService === undefined) {
+	    return
+	  }
+
+	  const currentTypeOfService = socket[kTypeOfService];
+
+	  if (currentTypeOfService === typeOfService) {
+	    return
+	  }
+
+	  try {
+	    socket.setTypeOfService(typeOfService);
+	    socket[kTypeOfService] = typeOfService;
+	  } catch {
+	    // QoS marking is best-effort. setTypeOfService() can throw synchronously on
+	    // some platforms depending on socket state, but that must not abort the request.
+	  }
+	}
+
 	/**
 	 * @param {import('./client.js')} client
 	 * @param {import('../core/request.js')} request
@@ -46333,9 +46685,7 @@ function requireClientH1 () {
 	    socket[kBlocking] = true;
 	  }
 
-	  if (socket.setTypeOfService) {
-	    socket.setTypeOfService(request.typeOfService);
-	  }
+	  setTypeOfService(socket, request);
 
 	  let header = `${method} ${path} HTTP/1.1\r\n`;
 
@@ -47130,8 +47480,6 @@ function requireClientH2 () {
 	}
 
 	function onHttp2SessionError (err) {
-	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	  this[kSocket][kError] = err;
 	  this[kClient][kOnError](err);
 	}
@@ -47273,8 +47621,6 @@ function requireClientH2 () {
 	}
 
 	function onHttp2SocketError (err) {
-	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	  this[kError] = err;
 
 	  this[kClient][kOnError](err);
@@ -47412,13 +47758,17 @@ function requireClientH2 () {
 
 	      stream = session.request(headers, { endStream: false, signal });
 	      stream[kHTTP2Stream] = true;
+	      ++session[kOpenStreams];
 
 	      stream.once('response', (headers, _flags) => {
 	        const { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers;
 
-	        request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream);
-
-	        ++session[kOpenStreams];
+	        try {
+	          request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream);
+	        } catch (err) {
+	          abort(err);
+	          return
+	        }
 	        completeRequest(client, request);
 	      });
 
@@ -47447,11 +47797,16 @@ function requireClientH2 () {
 	    // We disabled endStream to allow the user to write to the stream
 	    stream = session.request(headers, { endStream: false, signal });
 	    stream[kHTTP2Stream] = true;
+	    ++session[kOpenStreams];
 	    stream.on('response', headers => {
 	      const { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers;
 
-	      request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream);
-	      ++session[kOpenStreams];
+	      try {
+	        request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream);
+	      } catch (err) {
+	        abort(err);
+	        return
+	      }
 	      completeRequest(client, request);
 	    });
 	    stream.on('error', abort);
@@ -48011,7 +48366,8 @@ function requireClient () {
 	    initialWindowSize,
 	    connectionWindowSize,
 	    pingInterval,
-	    webSocket
+	    webSocket,
+	    eventSource
 	  } = {}) {
 	    if (keepAlive !== undefined) {
 	      throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -48119,7 +48475,7 @@ function requireClient () {
 	      throw new InvalidArgumentError('pingInterval must be a positive integer, greater or equal to 0')
 	    }
 
-	    super({ webSocket });
+	    super({ webSocket, eventSource });
 
 	    if (typeof connect !== 'function') {
 	      connect = buildConnector({
@@ -49457,7 +49813,7 @@ function requireAgent$1 () {
 	}
 
 	class Agent extends DispatcherBase {
-	  constructor ({ factory = defaultFactory, maxOrigins = Infinity, connect, ...options } = {}) {
+	  constructor ({ factory = defaultFactory, maxOrigins = Infinity, connect, tls, ...options } = {}) {
 	    if (typeof factory !== 'function') {
 	      throw new InvalidArgumentError('factory must be a function.')
 	    }
@@ -49476,7 +49832,11 @@ function requireAgent$1 () {
 	      connect = { ...connect };
 	    }
 
-	    this[kOptions] = { ...util.deepClone(options), maxOrigins, connect };
+	    if (tls && typeof tls !== 'function') {
+	      tls = { ...tls };
+	    }
+
+	    this[kOptions] = { ...util.deepClone(options), maxOrigins, connect, tls };
 	    this[kFactory] = factory;
 	    this[kClients] = new Map();
 	    this[kOrigins] = new Set();
@@ -51035,6 +51395,55 @@ function requireRetryHandler () {
 	  }
 	}
 
+	// A stable controller handed to the downstream handler for the lifetime of the
+	// request. Each transparent retry/resume is a separate dispatch with its own
+	// connection controller. The proxy always forwards to the active connection
+	// while preserving a downstream pause across controller replacement.
+	class RetryController {
+	  #paused = false
+	  #target = null
+
+	  set target (target) {
+	    this.#target = target;
+	    if (this.#paused) {
+	      target?.pause();
+	    }
+	  }
+
+	  get target () { return this.#target }
+
+	  pause () {
+	    this.#paused = true;
+	    this.#target?.pause();
+	  }
+
+	  resume () {
+	    this.#paused = false;
+	    this.#target?.resume();
+	  }
+
+	  abort (reason) {
+	    this.#target?.abort(reason);
+	  }
+
+	  get paused () { return this.#paused || (this.#target?.paused ?? false) }
+	  get aborted () { return this.#target?.aborted ?? false }
+	  get reason () { return this.#target?.reason ?? null }
+	  get rawHeaders () { return this.#target?.rawHeaders ?? null }
+	  set rawHeaders (value) {
+	    if (this.#target) {
+	      this.#target.rawHeaders = value;
+	    }
+	  }
+
+	  get rawTrailers () { return this.#target?.rawTrailers ?? null }
+	  set rawTrailers (value) {
+	    if (this.#target) {
+	      this.#target.rawTrailers = value;
+	    }
+	  }
+	}
+
 	class RetryHandler {
 	  constructor (opts, { dispatch, handler }) {
 	    const { retryOptions, ...dispatchOpts } = opts;
@@ -51089,6 +51498,7 @@ function requireRetryHandler () {
 	    this.start = 0;
 	    this.end = null;
 	    this.etag = null;
+	    this.controllerProxy = new RetryController();
 	  }
 
 	  onResponseStartWithRetry (controller, statusCode, headers, statusMessage, err) {
@@ -51099,11 +51509,11 @@ function requireRetryHandler () {
 	          // The downstream handler already received the response from an
 	          // earlier attempt. Forwarding this response would replace the
 	          // downstream body and leave the original body pending forever.
-	          this.handler.onResponseError?.(controller, err);
+	          this.handler.onResponseError?.(this.controllerProxy, err);
 	        } else {
 	          this.headersSent = true;
 	          this.checkpointResponseEnd(headers);
-	          this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+	          this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
 	        }
 	      } else {
 	        this.error = err;
@@ -51115,7 +51525,7 @@ function requireRetryHandler () {
 	    if (isDisturbed(this.opts.body)) {
 	      this.headersSent = true;
 	      this.checkpointResponseEnd(headers);
-	      this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+	      this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
 	      return
 	    }
 
@@ -51125,11 +51535,11 @@ function requireRetryHandler () {
 	          // The downstream handler already received the response from an
 	          // earlier attempt. Forwarding this response would replace the
 	          // downstream body and leave the original body pending forever.
-	          this.handler.onResponseError?.(controller, passedErr);
+	          this.handler.onResponseError?.(this.controllerProxy, passedErr);
 	        } else {
 	          this.headersSent = true;
 	          this.checkpointResponseEnd(headers);
-	          this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+	          this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
 	        }
 	        controller.resume();
 	        return
@@ -51165,13 +51575,14 @@ function requireRetryHandler () {
 	  }
 
 	  onRequestStart (controller, context) {
+	    this.controllerProxy.target = controller;
 	    if (!this.headersSent) {
-	      this.handler.onRequestStart?.(controller, context);
+	      this.handler.onRequestStart?.(this.controllerProxy, context);
 	    }
 	  }
 
-	  onRequestUpgrade (controller, statusCode, headers, socket) {
-	    this.handler.onRequestUpgrade?.(controller, statusCode, headers, socket);
+	  onRequestUpgrade (_controller, statusCode, headers, socket) {
+	    this.handler.onRequestUpgrade?.(this.controllerProxy, statusCode, headers, socket);
 	  }
 
 	  static [kRetryHandlerDefaultRetry] (err, { state, opts }, cb) {
@@ -51302,7 +51713,7 @@ function requireRetryHandler () {
 	        if (range == null) {
 	          this.headersSent = true;
 	          this.handler.onResponseStart?.(
-	            controller,
+	            this.controllerProxy,
 	            statusCode,
 	            headers,
 	            statusMessage
@@ -51351,7 +51762,7 @@ function requireRetryHandler () {
 
 	      this.headersSent = true;
 	      this.handler.onResponseStart?.(
-	        controller,
+	        this.controllerProxy,
 	        statusCode,
 	        headers,
 	        statusMessage
@@ -51364,30 +51775,30 @@ function requireRetryHandler () {
 	    }
 	  }
 
-	  onResponseData (controller, chunk) {
+	  onResponseData (_controller, chunk) {
 	    if (this.error) {
 	      return
 	    }
 
 	    this.start += chunk.length;
 
-	    this.handler.onResponseData?.(controller, chunk);
+	    this.handler.onResponseData?.(this.controllerProxy, chunk);
 	  }
 
-	  onResponseEnd (controller, trailers) {
+	  onResponseEnd (_controller, trailers) {
 	    if (this.error && this.retryOpts.throwOnError) {
 	      throw this.error
 	    }
 
 	    if (!this.error) {
 	      this.retryCount = 0;
-	      return this.handler.onResponseEnd?.(controller, trailers)
+	      return this.handler.onResponseEnd?.(this.controllerProxy, trailers)
 	    }
 
-	    this.retry(controller);
+	    this.retry();
 	  }
 
-	  retry (controller) {
+	  retry () {
 	    if (this.start !== 0) {
 	      const headers = { range: `bytes=${this.start}-${this.end ?? ''}` };
 
@@ -51409,23 +51820,23 @@ function requireRetryHandler () {
 	      this.retryCountCheckpoint = this.retryCount;
 	      this.dispatch(this.opts, this);
 	    } catch (err) {
-	      this.handler.onResponseError?.(controller, err);
+	      this.handler.onResponseError?.(this.controllerProxy, err);
 	    }
 	  }
 
 	  onResponseError (controller, err) {
 	    if (controller?.aborted || isDisturbed(this.opts.body) || (this.headersSent && !this.resume)) {
-	      this.handler.onResponseError?.(controller, err);
+	      this.handler.onResponseError?.(this.controllerProxy, err);
 	      return
 	    }
 
 	    function shouldRetry (returnedErr) {
 	      if (!returnedErr) {
-	        this.retry(controller);
+	        this.retry();
 	        return
 	      }
 
-	      this.handler?.onResponseError?.(controller, returnedErr);
+	      this.handler?.onResponseError?.(this.controllerProxy, returnedErr);
 	    }
 
 	    // We reconcile in case of a mix between network errors
@@ -55926,7 +56337,7 @@ function requireRedirectHandler () {
 	hasRequiredRedirectHandler = 1;
 
 	const util = requireUtil$5();
-	const { kBodyUsed } = requireSymbols();
+	const { kBodyUsed, kRedirectCacheControl } = requireSymbols();
 	const assert = require$$0$3;
 	const { InvalidArgumentError } = requireErrors();
 	const EE = require$$0$2;
@@ -55972,6 +56383,16 @@ function requireRedirectHandler () {
 	    this.maxRedirections = maxRedirections;
 	    this.handler = handler;
 	    this.history = [];
+	    // Per-hop metadata for each intermediate (suppressed) redirect hop: the
+	    // hop's status code and response headers. An outer cache uses it to honor a
+	    // hop's storage policy (e.g. `no-store`, `no-cache`, `Vary: *`) that would
+	    // otherwise be lost because the hop's response is not forwarded. It travels
+	    // as a non-enumerable property of the history array so it reaches the cache
+	    // without becoming part of the public request/response context.
+	    Object.defineProperty(this.history, kRedirectCacheControl, {
+	      value: [],
+	      enumerable: false
+	    });
 
 	    if (util.isStream(this.opts.body)) {
 	      // TODO (fix): Provide some way for the user to cache the file to e.g. /tmp
@@ -56055,6 +56476,15 @@ function requireRedirectHandler () {
 	      return
 	    }
 
+	    // This hop's response is suppressed (only its Location is used). Record its
+	    // status and headers so an outer cache can honor a restrictive policy that
+	    // would otherwise be lost when the final response is stored.
+	    this.history[kRedirectCacheControl].push({
+	      statusCode,
+	      headers: { ...headers },
+	      receivedAt: Date.now()
+	    });
+
 	    const { origin, pathname, search } = util.parseURL(new URL(this.location, this.opts.origin && new URL(this.opts.path, this.opts.origin)));
 	    const path = search ? `${pathname}${search}` : pathname;
 
@@ -56123,9 +56553,25 @@ function requireRedirectHandler () {
 	function cleanRequestHeaders (headers, removeContent, unknownOrigin) {
 	  const ret = [];
 	  if (Array.isArray(headers)) {
-	    for (let i = 0; i < headers.length; i += 2) {
-	      if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin)) {
-	        ret.push(headers[i], headers[i + 1]);
+	    // Headers may be either a flat alternating [name, value, name, value, ...]
+	    // list or an iterable of [name, value] pairs. A plain JavaScript array of
+	    // tuples (e.g. `Object.entries(headers)`) satisfies the iterable-of-pairs
+	    // public type, so we must distinguish the two representations before
+	    // iterating. Treating every Array as a flat list misreads each tuple as a
+	    // header name/value pair and defeats the cross-origin credential stripping.
+	    if (headers.length > 0 && Array.isArray(headers[0])) {
+	      // Array of [name, value] pairs.
+	      for (const [key, value] of headers) {
+	        if (!shouldRemoveHeader(key, removeContent, unknownOrigin)) {
+	          ret.push(key, value);
+	        }
+	      }
+	    } else {
+	      // Flat alternating [name, value, name, value, ...] list.
+	      for (let i = 0; i < headers.length; i += 2) {
+	        if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin)) {
+	          ret.push(headers[i], headers[i + 1]);
+	        }
 	      }
 	    }
 	  } else if (headers && typeof headers === 'object') {
@@ -57190,15 +57636,48 @@ function requireCache$2 () {
 	    headers = {};
 
 	    if (hasSafeIterator(opts.headers)) {
-	      for (const x of opts.headers) {
-	        if (!Array.isArray(x)) {
-	          throw new Error('opts.headers is not a valid header map')
+	      if (Array.isArray(opts.headers)) {
+	        // Array format: either flat alternating [key, value, ...] or an array
+	        // of [key, value] pairs.
+	        if (Array.isArray(opts.headers[0])) {
+	          for (const x of opts.headers) {
+	            if (!Array.isArray(x)) {
+	              throw new Error('opts.headers is not a valid header map')
+	            }
+	            const [key, val] = x;
+	            if (typeof key !== 'string' || typeof val !== 'string') {
+	              throw new Error('opts.headers is not a valid header map')
+	            }
+	            appendHeader(headers, key, val);
+	          }
+	        } else {
+	          if (opts.headers.length % 2 !== 0) {
+	            throw new Error('opts.headers is not a valid header map')
+	          }
+	          for (let i = 0; i < opts.headers.length; i += 2) {
+	            const key = opts.headers[i];
+	            const val = opts.headers[i + 1];
+	            if (typeof key !== 'string' || (typeof val !== 'string' && !Array.isArray(val))) {
+	              throw new Error('opts.headers is not a valid header map')
+	            }
+	            if (typeof val === 'string') {
+	              appendHeader(headers, key, val);
+	            } else {
+	              appendHeader(headers, key, val.map(item => typeof item === 'string' ? item : item.toString('latin1')));
+	            }
+	          }
 	        }
-	        const [key, val] = x;
-	        if (typeof key !== 'string' || typeof val !== 'string') {
-	          throw new Error('opts.headers is not a valid header map')
+	      } else {
+	        for (const x of opts.headers) {
+	          if (!Array.isArray(x)) {
+	            throw new Error('opts.headers is not a valid header map')
+	          }
+	          const [key, val] = x;
+	          if (typeof key !== 'string' || typeof val !== 'string') {
+	            throw new Error('opts.headers is not a valid header map')
+	          }
+	          appendHeader(headers, key, val);
 	        }
-	        appendHeader(headers, key, val);
 	      }
 	    } else {
 	      for (const key of Object.keys(opts.headers)) {
@@ -58361,6 +58840,7 @@ function requireCacheHandler () {
 	hasRequiredCacheHandler = 1;
 
 	const util = requireUtil$5();
+	const { kRedirectCacheControl } = requireSymbols();
 	const {
 	  parseCacheControlHeader,
 	  hasInvalidCacheControlDirective,
@@ -58369,9 +58849,33 @@ function requireCacheHandler () {
 	  isInvalidOrWildcardVaryHeader,
 	  isEtagUsable
 	} = requireCache$2();
+
+	/**
+	 * A suppressed redirect hop recorded by the redirect handler. Carried on
+	 * {@link kRedirectCacheControl} and inspected by the cache handler before the
+	 * final response is stored under the original request key.
+	 *
+	 * @typedef {object} RedirectHop
+	 * @property {number} statusCode The hop's response status code (e.g. 302).
+	 * @property {import('../../types/header.d.ts').IncomingHttpHeaders} headers The hop's response headers.
+	 * @property {number} receivedAt The time the hop's response headers were received.
+	 */
 	const { parseHttpDate } = requireDate();
 
 	function noop () {}
+
+	/**
+	 * @param {string | URL} a
+	 * @param {string | URL} b
+	 * @returns {boolean}
+	 */
+	function sameOrigin (a, b) {
+	  try {
+	    return new URL(String(a)).origin === new URL(String(b)).origin
+	  } catch {
+	    return String(a) === String(b)
+	  }
+	}
 
 	// Status codes that we can use some heuristics on to cache
 	const HEURISTICALLY_CACHEABLE_STATUS_CODES = [
@@ -58389,6 +58893,10 @@ function requireCacheHandler () {
 
 	const MAX_RESPONSE_AGE = 2147483647000;
 
+	// Retention for revalidation-only entries (zero freshness lifetime but a
+	// validator present); each successful revalidation re-stores the entry.
+	const REVALIDATION_ONLY_RETENTION = 86400000; // 24 hours
+
 	function trimOWS (value) {
 	  return value.replace(/^[\t ]+|[\t ]+$/g, '')
 	}
@@ -58401,6 +58909,16 @@ function requireCacheHandler () {
 	  }
 
 	  return false
+	}
+
+	function appendVaryValues (target, varyValue) {
+	  if (Array.isArray(varyValue)) {
+	    for (let i = 0; i < varyValue.length; i++) {
+	      target.push(varyValue[i]);
+	    }
+	  } else if (varyValue != null) {
+	    target.push(varyValue);
+	  }
 	}
 
 	function appendConnectionHeaderTokens (headersToRemove, connectionHeader) {
@@ -58476,6 +58994,25 @@ function requireCacheHandler () {
 	}
 
 	/**
+	 * Whether the original request carried a credential that is not reflected in
+	 * the cache key. The memory/sqlite stores key an entry on origin, method, path
+	 * and `vary` only, so a credentialed request that is redirected to a resource
+	 * that varies per principal must not be stored under the original (alias) key:
+	 * a later caller would be served the first principal's body. The set mirrors the
+	 * request credentials the redirect handler strips across origins (`authorization`,
+	 * `cookie`, `proxy-authorization`).
+	 *
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders | undefined} headers
+	 * @returns {boolean}
+	 */
+	function requestCarriesCredentials (headers) {
+	  return headers != null && (
+	    Object.hasOwn(headers, 'authorization') ||
+	    Object.hasOwn(headers, 'cookie') ||
+	    Object.hasOwn(headers, 'proxy-authorization')
+	  )
+	}
+	/**
 	 * @typedef {import('../../types/dispatcher.d.ts').default.DispatchHandler} DispatchHandler
 	 *
 	 * @implements {DispatchHandler}
@@ -58512,6 +59049,22 @@ function requireCacheHandler () {
 	  #writeStream
 
 	  /**
+	   * The URLs visited while following redirects, shared by reference from the
+	   * redirect handler through the request context. Carries the suppressed hops'
+	   * status/headers under {@link kRedirectCacheControl}.
+	   * @type {URL[] | undefined}
+	   */
+	  #history
+
+	  #replaying304 = false
+	  #suppress304End = false
+
+	  /**
+	   * @type {{ controller: import('../../types/dispatcher.d.ts').default.DispatchController, trailers: import('../../types/header.d.ts').IncomingHttpHeaders } | undefined}
+	   */
+	  #pending304End
+
+	  /**
 	   * @param {import('../../types/cache-interceptor.d.ts').default.CacheHandlerOptions} opts
 	   * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} cacheKey
 	   * @param {import('../../types/dispatcher.d.ts').default.DispatchHandler} handler
@@ -58527,6 +59080,12 @@ function requireCacheHandler () {
 	  onRequestStart (controller, context) {
 	    this.#writeStream?.destroy();
 	    this.#writeStream = undefined;
+	    this.#replaying304 = false;
+	    this.#suppress304End = false;
+	    this.#pending304End = undefined;
+	    // The redirect handler mutates this shared history as redirects are
+	    // followed, allowing the cache to identify the response's actual origin.
+	    this.#history = context?.history;
 	    this.#handler.onRequestStart?.(controller, context);
 	  }
 
@@ -58566,6 +59125,62 @@ function requireCacheHandler () {
 	      return downstreamOnHeaders()
 	    }
 
+	    // A credential-bearing request that was redirected must not have the final
+	    // hop's response stored under the original request's key. The cache key
+	    // does not include the credential, and the redirect target may vary per
+	    // principal (e.g. `/me` -> `/profile/{user}`), so replaying the body under
+	    // the alias key would leak one principal's data to another — or to an
+	    // unauthenticated caller — from a shared cache. The final hop's permissive
+	    // cache-control (e.g. `public`) does not authorize this: the credential was
+	    // presented to the original hop, not the resource that actually produced
+	    // the body. Fail closed. A history with more than one entry means at least
+	    // one redirect was actually followed (a single non-redirected hop records
+	    // exactly one entry), so a plain revalidation is not mistaken for a redirect.
+	    if (
+	      this.#history && this.#history.length > 1 &&
+	      requestCarriesCredentials(this.#cacheKey.headers)
+	    ) {
+	      return downstreamOnHeaders()
+	    }
+
+	    // A cross-origin redirect can change the origin that actually produced the
+	    // final response. Keying that response on the original (trusted) origin
+	    // would let a redirect target control an entry for a URL the application
+	    // trusts. Every hop in the redirect chain must stay on the cache key's
+	    // origin. An intermediate cross-origin hop can bounce back to the trusted
+	    // origin (or to any cacheable asset there) even when the final response
+	    // comes from the trusted origin, so checking only the final URL is not
+	    // enough.
+	    if (this.#history && this.#history.length > 0) {
+	      for (const hopUrl of this.#history) {
+	        if (!sameOrigin(hopUrl.origin, this.#cacheKey.origin)) {
+	          return downstreamOnHeaders()
+	        }
+	      }
+	    }
+
+	    // A redirect hop that is not forwarded can still carry a storage policy
+	    // (for example `no-store`, `private` for a shared cache, `no-cache`,
+	    // `must-revalidate`, zero freshness, or `Vary: *`) that the final response
+	    // body does not inherit. Honor it, otherwise a redirect that must not be
+	    // stored (or that selects a private/authenticated target) could be
+	    // laundered into a cacheable final response under the original key.
+	    const now = Date.now();
+	    const redirectHopInfo = this.#history?.[kRedirectCacheControl];
+	    const redirectPolicy = redirectHopInfo?.length > 0
+	      ? getRedirectPolicy(
+	        this.#cacheType,
+	        this.#cacheKey.method,
+	        redirectHopInfo,
+	        this.#cacheKey.headers,
+	        this.#cacheByDefault,
+	        now
+	      )
+	      : undefined;
+	    if (redirectHopInfo?.length > 0 && redirectPolicy === undefined) {
+	      return downstreamOnHeaders()
+	    }
+
 	    const cacheControlHeader = resHeaders['cache-control'];
 	    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {};
 
@@ -58598,7 +59213,6 @@ function requireCacheHandler () {
 	      return downstreamOnHeaders()
 	    }
 
-	    const now = Date.now();
 	    const resAge = Object.hasOwn(resHeaders, 'age') ? getAge(resHeaders.age) : undefined;
 	    if (resAge !== undefined && resAge >= MAX_RESPONSE_AGE) {
 	      // Response considered stale
@@ -58615,10 +59229,18 @@ function requireCacheHandler () {
 	    const apparentAge = resDate ? Math.max(0, now - resDate.getTime()) : 0;
 	    const currentAge = Math.max(apparentAge, resAge ?? 0);
 
+	    const hasValidator =
+	      (typeof resHeaders.etag === 'string' && isEtagUsable(resHeaders.etag)) ||
+	      typeof resHeaders['last-modified'] === 'string';
+
 	    const staleAt =
-	      determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives) ??
+	      determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives, hasValidator) ??
 	      this.#cacheByDefault;
-	    if (staleAt === undefined || currentAge >= staleAt) {
+	    // Zero freshness lifetime but a validator: stale from the start, yet still
+	    // storable since each reuse is preceded by a revalidation request.
+	    // https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4
+	    const revalidationOnly = staleAt === 0 && hasValidator;
+	    if (staleAt === undefined || (currentAge >= staleAt && !revalidationOnly)) {
 	      if (cacheControlHeader || staleAt !== undefined) {
 	        deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
 	      }
@@ -58627,24 +59249,65 @@ function requireCacheHandler () {
 	    }
 
 	    const baseTime = now - currentAge;
-	    const absoluteStaleAt = staleAt + baseTime;
-	    if (now >= absoluteStaleAt) {
+	    let absoluteStaleAt = staleAt + baseTime;
+	    if (redirectPolicy !== undefined) {
+	      absoluteStaleAt = Math.min(absoluteStaleAt, redirectPolicy.staleAt);
+	    }
+	    if (now >= absoluteStaleAt && !revalidationOnly) {
 	      // Response is already stale
 	      deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
 	      return downstreamOnHeaders()
 	    }
 
+	    // Union the `Vary` of every suppressed redirect hop with the final
+	    // response's `Vary`. A 3xx hop that negotiates its target on `Authorization`
+	    // / `Cookie` (or any other header) must make the stored entry vary on those
+	    // headers too, or an authenticated user's private response would be served
+	    // to unrelated callers.
 	    let varyDirectives;
-	    if (this.#cacheKey.headers && resHeaders.vary) {
-	      varyDirectives = parseVaryHeader(resHeaders.vary, this.#cacheKey.headers);
-	      if (!varyDirectives) {
-	        // Parse error
-	        return downstreamOnHeaders()
+	    const combinedVary = [];
+	    if (redirectHopInfo) {
+	      for (const hop of redirectHopInfo) {
+	        appendVaryValues(combinedVary, hop?.headers?.vary);
+	      }
+	    }
+	    appendVaryValues(combinedVary, resHeaders.vary);
+	    if (combinedVary.length > 0) {
+	      for (const varyHeader of combinedVary) {
+	        if (hasVaryStar(varyHeader)) {
+	          // `Vary: *` means the response can never be reused (RFC 9111 §4.1)
+	          return downstreamOnHeaders()
+	        }
+	      }
+	      if (this.#cacheKey.headers) {
+	        varyDirectives = parseVaryHeader(combinedVary, this.#cacheKey.headers);
+	        if (!varyDirectives) {
+	          // Parse error
+	          return downstreamOnHeaders()
+	        }
+	      }
+	    }
+
+	    // When the entry was folded from a redirect chain, the final response's
+	    // stale-serving directives (RFC 5861) must not outlive the hops' freshness.
+	    // A hop that grants no `stale-while-revalidate` / `stale-if-error` caps
+	    // stale serving at its freshness, so the final response cannot launder a
+	    // stale-serving window past the hop-bounded `staleAt`. Drop those directives
+	    // (and keep the `proxy-revalidate` the hop policy may require) so the entry
+	    // revalidates at `staleAt` instead of being served stale for the final
+	    // response's window.
+	    let effectiveCacheControlDirectives = cacheControlDirectives;
+	    if (redirectPolicy !== undefined) {
+	      effectiveCacheControlDirectives = { ...cacheControlDirectives };
+	      delete effectiveCacheControlDirectives['stale-while-revalidate'];
+	      delete effectiveCacheControlDirectives['stale-if-error'];
+	      if (redirectPolicy.requiresRevalidation === true) {
+	        effectiveCacheControlDirectives['proxy-revalidate'] = true;
 	      }
 	    }
 
 	    const cachedAt = baseTime;
-	    const deleteAt = determineDeleteAt(baseTime, now, cacheControlDirectives, absoluteStaleAt);
+	    const deleteAt = determineDeleteAt(baseTime, now, effectiveCacheControlDirectives, absoluteStaleAt);
 	    const strippedHeaders = stripNecessaryHeaders(resHeaders, cacheControlDirectives);
 
 	    /**
@@ -58655,7 +59318,7 @@ function requireCacheHandler () {
 	      statusMessage,
 	      headers: strippedHeaders,
 	      vary: varyDirectives,
-	      cacheControlDirectives,
+	      cacheControlDirectives: effectiveCacheControlDirectives,
 	      cachedAt,
 	      staleAt: absoluteStaleAt,
 	      deleteAt
@@ -58664,10 +59327,51 @@ function requireCacheHandler () {
 	    // Not modified, re-use the cached value
 	    // https://www.rfc-editor.org/rfc/rfc9111.html#name-handling-304-not-modified
 	    if (statusCode === 304) {
+	      this.#replaying304 = true;
+	      let done = false;
+	      const finish304 = () => {
+	        if (done) {
+	          return
+	        }
+	        done = true;
+	        this.#replaying304 = false;
+	        if (this.#pending304End) {
+	          const { controller, trailers } = this.#pending304End;
+	          this.#pending304End = undefined;
+	          this.#writeStream?.end();
+	          this.#handler.onResponseEnd?.(controller, trailers);
+	        }
+	      };
+
+	      // The cached body below is replayed to the downstream handler from later
+	      // stream ticks (or an iterator loop), outside the dispatcher's own error
+	      // handling, so a throwing downstream handler must be converged to a
+	      // per-request error instead of escaping as an uncaught exception.
+	      const failReplay = (err) => {
+	        if (done) {
+	          return
+	        }
+	        done = true;
+	        this.#replaying304 = false;
+	        this.#suppress304End = true;
+	        this.#pending304End = undefined;
+	        this.#writeStream?.destroy();
+	        // The v7 handler API has no downstream block/release controller. Keep
+	        // the origin response lifecycle independent, suppress its completion,
+	        // and report the replay failure directly downstream.
+	        try {
+	          this.#handler.onResponseError?.(controller, err);
+	        } catch {
+	          // Never let a missing legacy error callback escape this async replay.
+	        }
+	      };
+
 	      const handle304 = (cachedValue) => {
 	        if (!cachedValue) {
 	          // Do not create a new cache entry, as a 304 won't have a body - so cannot be cached.
-	          return downstreamOnHeaders()
+	          downstreamOnHeaders();
+	          finish304();
+	          return
 	        }
 
 	        // Re-use the cached value: statuscode, statusmessage, headers and body
@@ -58682,6 +59386,7 @@ function requireCacheHandler () {
 	        this.#writeStream = this.#store.createWriteStream(this.#cacheKey, value);
 
 	        if (!this.#writeStream || !cachedValue?.body) {
+	          finish304();
 	          return
 	        }
 
@@ -58689,13 +59394,21 @@ function requireCacheHandler () {
 	          const bodyIterator = cachedValue.body.values();
 
 	          const streamCachedBody = () => {
-	            for (const chunk of bodyIterator) {
-	              const full = this.#writeStream.write(chunk) === false;
-	              this.#handler.onResponseData?.(controller, chunk);
-	              // when stream is full stop writing until we get a 'drain' event
-	              if (full) {
-	                break
+	            if (done) {
+	              return
+	            }
+	            try {
+	              for (const chunk of bodyIterator) {
+	                const full = this.#writeStream?.write(chunk) === false;
+	                this.#handler.onResponseData?.(controller, chunk);
+	                // when stream is full stop writing until we get a 'drain' event
+	                if (full) {
+	                  return
+	                }
 	              }
+	              finish304();
+	            } catch (err) {
+	              failReplay(err);
 	            }
 	          };
 
@@ -58703,6 +59416,8 @@ function requireCacheHandler () {
 	            .on('error', function () {
 	              handler.#writeStream = undefined;
 	              handler.#store.delete(handler.#cacheKey);
+	              // Keep replaying downstream without the store.
+	              streamCachedBody();
 	            })
 	            .on('drain', () => {
 	              streamCachedBody();
@@ -58710,6 +59425,8 @@ function requireCacheHandler () {
 	            .on('close', function () {
 	              if (handler.#writeStream === this) {
 	                handler.#writeStream = undefined;
+	                // Keep replaying downstream without the store.
+	                streamCachedBody();
 	              }
 	            });
 
@@ -58718,15 +59435,22 @@ function requireCacheHandler () {
 	          // Readable stream body (e.g. from async/remote cache stores)
 	          cachedValue.body
 	            .on('data', (chunk) => {
-	              this.#writeStream.write(chunk);
-	              this.#handler.onResponseData?.(controller, chunk);
+	              try {
+	                this.#writeStream?.write(chunk);
+	                this.#handler.onResponseData?.(controller, chunk);
+	              } catch (err) {
+	                cachedValue.body.destroy();
+	                failReplay(err);
+	              }
 	            })
 	            .on('end', () => {
-	              this.#writeStream.end();
+	              this.#writeStream?.end();
+	              finish304();
 	            })
 	            .on('error', () => {
 	              this.#writeStream = undefined;
 	              this.#store.delete(this.#cacheKey);
+	              finish304();
 	            });
 
 	          this.#writeStream
@@ -58739,6 +59463,8 @@ function requireCacheHandler () {
 	                handler.#writeStream = undefined;
 	              }
 	            });
+	        } else {
+	          finish304();
 	        }
 	      };
 
@@ -58747,7 +59473,9 @@ function requireCacheHandler () {
 	       */
 	      const result = this.#store.get(this.#cacheKey);
 	      if (result && typeof result.then === 'function') {
-	        result.then(handle304);
+	        result.then(handle304, () => handle304(undefined)).catch((err) => {
+	          failReplay(err);
+	        });
 	      } else {
 	        handle304(result);
 	      }
@@ -58794,11 +59522,21 @@ function requireCacheHandler () {
 	  }
 
 	  onResponseEnd (controller, trailers) {
+	    if (this.#suppress304End) {
+	      this.#suppress304End = false;
+	      return
+	    }
+	    if (this.#replaying304) {
+	      this.#pending304End = { controller, trailers };
+	      return
+	    }
 	    this.#writeStream?.end();
 	    this.#handler.onResponseEnd?.(controller, trailers);
 	  }
 
 	  onResponseError (controller, err) {
+	    this.#replaying304 = false;
+	    this.#pending304End = undefined;
 	    this.#writeStream?.destroy(err);
 	    this.#writeStream = undefined;
 	    this.#handler.onResponseError?.(controller, err);
@@ -58917,6 +59655,139 @@ function requireCacheHandler () {
 	}
 
 	/**
+	 * Determine the absolute freshness deadline imposed by all suppressed redirect
+	 * hops. Returning `undefined` means at least one hop cannot safely be folded
+	 * into the final response under the original request key.
+	 *
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @param {string} method
+	 * @param {RedirectHop[]} redirectHops
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} reqHeaders
+	 * @param {number | undefined} cacheByDefault
+	 * @param {number} now
+	 * @returns {{ staleAt: number, requiresRevalidation: boolean } | undefined}
+	 */
+	function getRedirectPolicy (cacheType, method, redirectHops, reqHeaders, cacheByDefault, now) {
+	  let staleAt = Infinity;
+	  let requiresRevalidation = false;
+
+	  for (const hop of redirectHops) {
+	    const hopPolicy = getRedirectHopPolicy(cacheType, method, hop, reqHeaders, cacheByDefault);
+	    if (hopPolicy === undefined || hopPolicy.staleAt <= now) {
+	      return undefined
+	    }
+
+	    staleAt = Math.min(staleAt, hopPolicy.staleAt);
+	    requiresRevalidation ||= hopPolicy.requiresRevalidation;
+	  }
+
+	  return { staleAt, requiresRevalidation }
+	}
+
+	/**
+	 * Calculate one redirect hop's absolute freshness deadline using the same age,
+	 * date, expiration, invalid-directive, and heuristic rules as a final response.
+	 *
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @param {string} method
+	 * @param {RedirectHop} hop
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} reqHeaders
+	 * @param {number | undefined} cacheByDefault
+	 * @returns {{ staleAt: number, requiresRevalidation: boolean } | undefined}
+	 */
+	function getRedirectHopPolicy (cacheType, method, hop, reqHeaders, cacheByDefault) {
+	  if (!Number.isInteger(hop?.statusCode) || !Number.isFinite(hop?.receivedAt)) {
+	    return undefined
+	  }
+
+	  const hopHeaders = hop.headers ?? {};
+	  const cacheControlHeader = hopHeaders['cache-control'];
+	  const hopCacheControl = cacheControlHeader
+	    ? parseCacheControlHeader(cacheControlHeader)
+	    : {};
+
+	  // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1-5
+	  if (hopHeaders.vary && hasVaryStar(hopHeaders.vary)) {
+	    return undefined
+	  }
+
+	  if (hopCacheControl['no-store'] === true) {
+	    return undefined
+	  }
+
+	  // A qualified `private` directive still marks the named fields as private.
+	  // Folding a redirect that says `private="location"` would preserve the
+	  // private target choice in the final body even though a shared cache is not
+	  // allowed to store that Location field.
+	  if (cacheType === 'shared' && Object.hasOwn(hopCacheControl, 'private')) {
+	    return undefined
+	  }
+
+	  // These directives require the hop to be revalidated before reuse. Since the
+	  // cache stores only the final response, it cannot independently validate the
+	  // suppressed redirect response.
+	  if (
+	    Object.hasOwn(hopCacheControl, 'no-cache') ||
+	    hopCacheControl['must-revalidate'] === true ||
+	    (cacheType === 'shared' && hopCacheControl['proxy-revalidate'] === true)
+	  ) {
+	    return undefined
+	  }
+
+	  const heuristicallyCacheable =
+	    hopHeaders['last-modified'] &&
+	    arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, hop.statusCode);
+	  if (
+	    !cacheControlHeader &&
+	    !hopHeaders.expires &&
+	    !heuristicallyCacheable &&
+	    !cacheByDefault
+	  ) {
+	    return undefined
+	  }
+
+	  if (!canCacheResponse(cacheType, method, hop.statusCode, hopHeaders, hopCacheControl, reqHeaders)) {
+	    return undefined
+	  }
+
+	  const age = Object.hasOwn(hopHeaders, 'age') ? getAge(hopHeaders.age) : undefined;
+	  if (age !== undefined && age >= MAX_RESPONSE_AGE) {
+	    return undefined
+	  }
+
+	  const responseDate = Object.hasOwn(hopHeaders, 'date') ? getDate(hopHeaders.date) : undefined;
+	  if (responseDate === null) {
+	    return undefined
+	  }
+
+	  const apparentAge = responseDate ? Math.max(0, hop.receivedAt - responseDate.getTime()) : 0;
+	  const currentAge = Math.max(apparentAge, age ?? 0);
+	  const hasValidator =
+	    (typeof hopHeaders.etag === 'string' && isEtagUsable(hopHeaders.etag)) ||
+	    typeof hopHeaders['last-modified'] === 'string';
+	  const freshnessLifetime =
+	    determineStaleAt(
+	      cacheType,
+	      hop.receivedAt,
+	      age,
+	      hopHeaders,
+	      responseDate,
+	      hopCacheControl,
+	      hasValidator
+	    ) ?? cacheByDefault;
+
+	  if (freshnessLifetime === undefined) {
+	    return undefined
+	  }
+
+	  return {
+	    staleAt: hop.receivedAt - currentAge + freshnessLifetime,
+	    // RFC 9111 §5.2.2.10: s-maxage implies proxy-revalidate for shared caches.
+	    requiresRevalidation: cacheType === 'shared' && Object.hasOwn(hopCacheControl, 's-maxage')
+	  }
+	}
+
+	/**
 	 * @param {string | string[]} dateHeader
 	 * @returns {Date | null | undefined}
 	 */
@@ -58970,10 +59841,12 @@ function requireCacheHandler () {
 	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
 	 * @param {Date | undefined} responseDate
 	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
+	 * @param {boolean} hasValidator whether the response has a validator (etag or
+	 * last-modified) that revalidation requests can be made with
 	 *
 	 * @returns {number | undefined} time that the value is stale at in seconds or undefined if it shouldn't be cached
 	 */
-	function determineStaleAt (cacheType, now, age, resHeaders, responseDate, cacheControlDirectives) {
+	function determineStaleAt (cacheType, now, age, resHeaders, responseDate, cacheControlDirectives, hasValidator) {
 	  if (cacheType === 'shared') {
 	    // Prioritize s-maxage since we're a shared cache
 	    //  s-maxage > max-age > Expire
@@ -59047,6 +59920,12 @@ function requireCacheHandler () {
 	    return 31536000000
 	  }
 
+	  if (cacheControlDirectives['no-cache'] === true && hasValidator) {
+	    // No freshness source, but a validator lets us revalidate before reuse.
+	    // https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4
+	    return 0
+	  }
+
 	  return undefined
 	}
 
@@ -59083,6 +59962,11 @@ function requireCacheHandler () {
 	  // revalidated.
 	  if (staleWhileRevalidate === -Infinity && staleIfError === -Infinity && immutable === -Infinity) {
 	    const freshnessLifetime = staleAt - baseTime;
+	    if (freshnessLifetime <= 0) {
+	      // Revalidation-only entry: no freshness lifetime to size the buffer on,
+	      // so retain it for a bounded window instead.
+	      return cachedAt + REVALIDATION_ONLY_RETENTION
+	    }
 	    const datePrecisionPadding = Math.min(Math.max(cachedAt - baseTime, 0), 1000);
 	    return staleAt + freshnessLifetime + datePrecisionPadding
 	  }
@@ -59569,7 +60453,16 @@ function requireCache$1 () {
 	const CacheHandler = requireCacheHandler();
 	const MemoryCacheStore = requireMemoryCacheStore();
 	const CacheRevalidationHandler = requireCacheRevalidationHandler();
-	const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader } = requireCache$2();
+	const {
+	  assertCacheStore,
+	  assertCacheMethods,
+	  makeCacheKey,
+	  normalizeHeaders,
+	  parseCacheControlHeader,
+	  isInvalidOrWildcardVaryHeader,
+	  parseVaryHeader,
+	  isEtagUsable
+	} = requireCache$2();
 	const { AbortError } = requireErrors();
 	const { parseHttpDate } = requireDate();
 
@@ -59701,6 +60594,25 @@ function requireCache$1 () {
 	  return headers['cache-control'] !== undefined
 	}
 
+	/**
+	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
+	 * @param {Record<string, string | string[] | null> | undefined} varyDirectives
+	 * @returns {boolean}
+	 */
+	function revalidationResponseAddsVary (result, varyDirectives) {
+	  if (!varyDirectives) {
+	    return false
+	  }
+
+	  for (const key in varyDirectives) {
+	    if (result.vary == null || !Object.hasOwn(result.vary, key)) {
+	      return true
+	    }
+	  }
+
+	  return false
+	}
+
 	function deleteCachedValue (store, cacheKey) {
 	  try {
 	    store.delete(cacheKey)?.catch?.(nop);
@@ -59735,6 +60647,47 @@ function requireCache$1 () {
 	  }
 
 	  return headers
+	}
+
+	function revalidationTargetMatchesCacheKey (cacheKey, context) {
+	  const history = context?.history;
+	  if (!Array.isArray(history) || history.length === 0) {
+	    return true
+	  }
+
+	  try {
+	    const cachedUrl = new URL(cacheKey.path, cacheKey.origin);
+	    const responseUrl = history[history.length - 1];
+	    return responseUrl.origin === cachedUrl.origin &&
+	      responseUrl.pathname === cachedUrl.pathname &&
+	      responseUrl.search === cachedUrl.search
+	  } catch {
+	    return false
+	  }
+	}
+
+	function revalidationEtagMatchesCachedValue (result, headers) {
+	  if (!Object.hasOwn(headers, 'etag')) {
+	    return true
+	  }
+
+	  const responseEtag = headers.etag;
+	  const cachedEtag = result.etag;
+	  if (
+	    typeof responseEtag !== 'string' ||
+	    typeof cachedEtag !== 'string' ||
+	    !isEtagUsable(responseEtag) ||
+	    !isEtagUsable(cachedEtag)
+	  ) {
+	    return false
+	  }
+
+	  if (!responseEtag.startsWith('W/')) {
+	    return responseEtag === cachedEtag
+	  }
+
+	  const cachedOpaqueTag = cachedEtag.startsWith('W/') ? cachedEtag.slice(2) : cachedEtag;
+	  return responseEtag.slice(2) === cachedOpaqueTag
 	}
 
 	/**
@@ -59879,21 +60832,35 @@ function requireCache$1 () {
 
 	  stream
 	    .on('error', function (err) {
+	      // Never rethrow: this runs from a stream event on a later tick, where a
+	      // throw would crash the process. Like core's Request.onResponseError,
+	      // the error is dropped if the handler has no onResponseError.
 	      if (!this.readableEnded) {
-	        if (typeof handler.onResponseError === 'function') {
-	          handler.onResponseError(controller, err);
-	        } else {
-	          throw err
-	        }
+	        handler.onResponseError?.(controller, err);
 	      }
 	    })
 	    .on('close', function () {
 	      if (!this.errored) {
-	        handler.onResponseEnd?.(controller, {});
+	        try {
+	          handler.onResponseEnd?.(controller, {});
+	        } catch (err) {
+	          // The stream is already closed, so the error can't be routed
+	          // through it; report it to the handler directly instead.
+	          handler.onResponseError?.(controller, err);
+	        }
 	      }
 	    });
 
-	  handler.onRequestStart?.(controller, context);
+	  // Downstream handler calls below run outside the dispatcher's own error
+	  // handling (on later ticks for the body, or inside a promise callback for
+	  // async stores), so a throw must be converged to a per-request error
+	  // instead of escaping as an uncaught exception.
+	  try {
+	    handler.onRequestStart?.(controller, context);
+	  } catch (err) {
+	    stream.destroy(err);
+	    return
+	  }
 
 	  if (stream.destroyed) {
 	    return
@@ -59909,13 +60876,24 @@ function requireCache$1 () {
 	    headers.warning = '110 - "response is stale"';
 	  }
 
-	  handler.onResponseStart?.(controller, result.statusCode, headers, result.statusMessage);
+	  controller.rawHeaders = util.toRawHeaders(headers);
+
+	  try {
+	    handler.onResponseStart?.(controller, result.statusCode, headers, result.statusMessage);
+	  } catch (err) {
+	    stream.destroy(err);
+	    return
+	  }
 
 	  if (opts.method === 'HEAD') {
 	    stream.destroy();
 	  } else {
 	    stream.on('data', function (chunk) {
-	      handler.onResponseData?.(controller, chunk);
+	      try {
+	        handler.onResponseData?.(controller, chunk);
+	      } catch (err) {
+	        stream.destroy(err);
+	      }
 	    });
 	  }
 	}
@@ -60013,6 +60991,14 @@ function requireCache$1 () {
 	    }
 
 	    const headers = makeRevalidationHeaders(opts, result);
+	    const refetch = () => {
+	      if (util.isStream(result.body)) {
+	        result.body.on('error', nop).destroy();
+	      }
+
+	      deleteCachedValue(globalOpts.store, cacheKey);
+	      return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+	    };
 
 	    // We need to revalidate the response
 	    return dispatch(
@@ -60024,17 +61010,18 @@ function requireCache$1 () {
 	        (success, context, statusCode, headers) => {
 	          if (success) {
 	            if (statusCode === 304) {
-	              if (revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)) {
-	                if (util.isStream(result.body)) {
-	                  result.body.on('error', nop).destroy();
-	                }
-
-	                deleteCachedValue(globalOpts.store, cacheKey);
-	                return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+	              if (
+	                !revalidationTargetMatchesCacheKey(cacheKey, context) ||
+	                !revalidationEtagMatchesCachedValue(result, headers) ||
+	                revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)
+	              ) {
+	                return refetch()
 	              }
 
 	              if (revalidationResponseUpdatesCacheControl(headers)) {
 	                deleteCachedValue(globalOpts.store, cacheKey);
+	              } else if (revalidationResponseAddsVary(result, headers.vary ? parseVaryHeader(headers.vary, opts.headers) : undefined)) {
+	                return refetch()
 	              }
 	            }
 
@@ -60168,6 +61155,28 @@ function requireCache$1 () {
 	            reqCacheControl,
 	            result
 	          ))
+	          .catch((err) => {
+	            // Any throw escaping handleResult on the async-store path (e.g. a
+	            // rejection from store.get() itself, or a throw in a code path not
+	            // converged by sendCachedValue) would otherwise surface as an
+	            // unhandled promise rejection and crash the process. Route it to
+	            // the handler instead, matching the synchronous store path where
+	            // the error propagates to the request() call site.
+	            if (typeof handler.onResponseError === 'function') {
+	              handler.onResponseError({
+	                rawHeaders: [],
+	                rawTrailers: [],
+	                pause () {},
+	                resume () {},
+	                get paused () { return false },
+	                get aborted () { return false },
+	                get reason () { return null },
+	                abort () {}
+	              }, err);
+	            } else {
+	              throw err
+	            }
+	          })
 	      } else {
 	        return handleResult(
 	          dispatch,
@@ -60202,6 +61211,60 @@ function requireDecompress () {
 	/** @typedef {import('node:stream').Transform} Controller */
 	/** @typedef {Transform&import('node:zlib').Zlib} DecompressorStream */
 
+	class DecompressController {
+	  #onPause
+	  #onResume
+	  #onAbort
+	  #paused = false
+
+	  constructor (onPause, onResume, onAbort) {
+	    this.#onPause = onPause;
+	    this.#onResume = onResume;
+	    this.#onAbort = onAbort;
+	    this.target = null;
+	  }
+
+	  pause () {
+	    if (this.#paused) {
+	      return
+	    }
+
+	    this.#paused = true;
+	    this.#onPause();
+	  }
+
+	  resume () {
+	    if (!this.#paused) {
+	      return
+	    }
+
+	    this.#paused = false;
+	    this.#onResume();
+	  }
+
+	  abort (reason) {
+	    this.target?.abort(reason);
+	    this.#onAbort(reason);
+	  }
+
+	  get paused () { return this.#paused }
+	  get aborted () { return this.target?.aborted ?? false }
+	  get reason () { return this.target?.reason ?? null }
+	  get rawHeaders () { return this.target?.rawHeaders ?? null }
+	  set rawHeaders (value) {
+	    if (this.target) {
+	      this.target.rawHeaders = value;
+	    }
+	  }
+
+	  get rawTrailers () { return this.target?.rawTrailers ?? null }
+	  set rawTrailers (value) {
+	    if (this.target) {
+	      this.target.rawTrailers = value;
+	    }
+	  }
+	}
+
 	/** @type {Record<string, () => DecompressorStream>} */
 	const supportedEncodings = {
 	  gzip: createGunzip,
@@ -60214,7 +61277,7 @@ function requireDecompress () {
 	};
 
 	const defaultSkipStatusCodes = /** @type {const} */ ([204, 304]);
-	const defaultMaxSize = 64 * 1024 * 1024;
+	const defaultMaxSize = 0;
 
 	/**
 	 * Limits the output of one stage in a decompression chain.
@@ -60246,7 +61309,7 @@ function requireDecompress () {
 	 * @typedef {Object} DecompressHandlerOptions
 	 * @property {number[]|Readonly<number[]>} [skipStatusCodes=[204, 304]] - List of status codes to skip decompression for
 	 * @property {boolean} [skipErrorResponses] - Whether to skip decompression for error responses (status codes >= 400)
-	 * @property {number} [maxSize=67108864] - Maximum decompressed response size in bytes
+	 * @property {number} [maxSize=0] - Maximum decompressed response size in bytes. 0 disables the limit
 	 */
 
 	class DecompressHandler extends DecoratorHandler {
@@ -60266,16 +61329,140 @@ function requireDecompress () {
 	  #terminated = false
 	  /** @type {boolean} */
 	  #inputEnded = false
+	  /** @type {boolean} */
+	  #inputBackpressured = false
+	  /** @type {boolean} */
+	  #upstreamPaused = false
+	  /** @type {boolean} */
+	  #draining = false
+	  /** @type {boolean} */
+	  #drainRequested = false
+	  /** @type {boolean} */
+	  #completionPending = false
+	  /** @type {DecompressorStream | undefined} */
+	  #finalDecompressor
+	  /** @type {DecompressController} */
+	  #controller
 
 	  constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true, maxSize = defaultMaxSize } = {}) {
-	    if (!Number.isSafeInteger(maxSize) || maxSize < 1) {
-	      throw new InvalidArgumentError('maxSize must be a positive integer')
+	    if (!Number.isSafeInteger(maxSize) || maxSize < 0) {
+	      throw new InvalidArgumentError('maxSize must be a non-negative integer')
 	    }
 
 	    super(handler);
 	    this.#skipStatusCodes = skipStatusCodes;
 	    this.#skipErrorResponses = skipErrorResponses;
 	    this.#maxSize = maxSize;
+	    this.#controller = new DecompressController(
+	      () => this.#onDownstreamPause(),
+	      () => this.#onDownstreamResume(),
+	      reason => {
+	        if (this.#inputEnded && !this.#terminated) {
+	          this.onResponseError(this.#controller, reason);
+	        }
+	      }
+	    );
+	  }
+
+	  #onDownstreamPause () {
+	    this.#pauseUpstream();
+	  }
+
+	  #onDownstreamResume () {
+	    const drainWasDeferred = this.#draining;
+	    this.#drainOutput();
+	    if (!drainWasDeferred) {
+	      this.#resumeUpstreamIfNeeded();
+	      this.#finishIfReady();
+	    }
+	  }
+
+	  #pauseUpstream () {
+	    if (!this.#upstreamPaused && !this.#terminated) {
+	      this.#upstreamPaused = true;
+	      this.#controller.target?.pause();
+	    }
+	  }
+
+	  #resumeUpstreamIfNeeded () {
+	    if (this.#upstreamPaused && !this.#controller.paused && !this.#inputBackpressured) {
+	      this.#upstreamPaused = false;
+	      if (!this.#inputEnded) {
+	        this.#controller.target?.resume();
+	      }
+	    }
+	  }
+
+	  #drainOutput () {
+	    if (this.#terminated || this.#controller.paused || !this.#finalDecompressor) {
+	      return
+	    }
+
+	    if (this.#draining) {
+	      this.#drainRequested = true;
+	      return
+	    }
+
+	    this.#draining = true;
+	    try {
+	      do {
+	        this.#drainRequested = false;
+	        let chunk;
+	        while (!this.#terminated && !this.#controller.paused && (chunk = this.#finalDecompressor.read()) !== null) {
+	          if (this.#maxSize > 0) {
+	            const decompressedSize = this.#decompressedSize + chunk.length;
+	            if (decompressedSize > this.#maxSize) {
+	              this.#fail(new ResponseExceededMaxSizeError(
+	                `Decompressed response size (${decompressedSize}) exceeded maxSize (${this.#maxSize})`
+	              ));
+	              return
+	            }
+
+	            this.#decompressedSize = decompressedSize;
+	          }
+
+	          try {
+	            const result = super.onResponseData(this.#controller, chunk);
+	            if (result === false && !this.#controller.paused) {
+	              this.#controller.pause();
+	            }
+	          } catch (err) {
+	            this.#fail(err);
+	            return
+	          }
+	        }
+	      } while (this.#drainRequested && !this.#terminated && !this.#controller.paused)
+	    } finally {
+	      this.#draining = false;
+	    }
+
+	    this.#resumeUpstreamIfNeeded();
+	    this.#finishIfReady();
+	  }
+
+	  #finishIfReady () {
+	    if (this.#terminated || !this.#completionPending || this.#controller.paused || this.#draining) {
+	      return
+	    }
+
+	    this.#cleanupDecompressors();
+	    try {
+	      super.onResponseEnd(this.#controller, this.#trailers);
+	    } catch (err) {
+	      this.#fail(err);
+	      return
+	    }
+	    this.#terminated = true;
+	  }
+
+	  #onDecompressionEnd () {
+	    if (this.#terminated) {
+	      return
+	    }
+
+	    this.#completionPending = true;
+	    this.#drainOutput();
+	    this.#finishIfReady();
 	  }
 
 	  /**
@@ -60331,7 +61518,7 @@ function requireDecompress () {
 	    const streams = [];
 	    for (let i = 0; i < decompressors.length; i++) {
 	      streams.push(decompressors[i]);
-	      if (i < decompressors.length - 1) {
+	      if (i < decompressors.length - 1 && this.#maxSize > 0) {
 	        streams.push(createMaxSizeLimiter(this.#maxSize));
 	      }
 	    }
@@ -60341,11 +61528,10 @@ function requireDecompress () {
 
 	  /**
 	   * Stops decompression and reports an error.
-	   * @param {Controller} controller - The controller to coordinate with
 	   * @param {Error} error - The decompression error
 	   * @returns {void}
 	   */
-	  #fail (controller, error) {
+	  #fail (error) {
 	    if (this.#terminated) {
 	      return
 	    }
@@ -60353,75 +61539,41 @@ function requireDecompress () {
 	    if (this.#inputEnded) {
 	      // The request is already marked complete once the compressed input ends,
 	      // so controller.abort() can no longer propagate decoder flush errors.
-	      this.onResponseError(controller, error);
+	      this.onResponseError(this.#controller, error);
 	    } else {
-	      controller.abort(error);
+	      this.#controller.abort(error);
 	    }
 	  }
 
 	  /**
-	   * Sets up event handlers for a decompressor stream using readable events
+	   * Sets up event handlers for the final decompressor stream.
 	   * @param {DecompressorStream} decompressor - The decompressor stream
-	   * @param {Controller} controller - The controller to coordinate with
 	   * @returns {void}
 	   */
-	  #setupDecompressorEvents (decompressor, controller) {
-	    decompressor.on('readable', () => {
-	      if (this.#terminated) {
-	        return
-	      }
-
-	      let chunk;
-	      while ((chunk = decompressor.read()) !== null) {
-	        const decompressedSize = this.#decompressedSize + chunk.length;
-	        if (decompressedSize > this.#maxSize) {
-	          this.#fail(controller, new ResponseExceededMaxSizeError(
-	            `Decompressed response size (${decompressedSize}) exceeded maxSize (${this.#maxSize})`
-	          ));
-	          return
-	        }
-
-	        this.#decompressedSize = decompressedSize;
-	        const result = super.onResponseData(controller, chunk);
-	        if (result === false) {
-	          break
-	        }
-	      }
-	    });
-
-	    decompressor.on('error', (error) => {
-	      this.#fail(controller, error);
-	    });
+	  #setupDecompressorEvents (decompressor) {
+	    this.#finalDecompressor = decompressor;
+	    decompressor.on('readable', () => this.#drainOutput());
+	    decompressor.on('error', (error) => this.#fail(error));
 	  }
 
 	  /**
 	   * Sets up event handling for a single decompressor
-	   * @param {Controller} controller - The controller to handle events
 	   * @returns {void}
 	   */
-	  #setupSingleDecompressor (controller) {
+	  #setupSingleDecompressor () {
 	    const decompressor = this.#decompressors[0];
-	    this.#setupDecompressorEvents(decompressor, controller);
+	    this.#setupDecompressorEvents(decompressor);
 
-	    decompressor.on('end', () => {
-	      if (this.#terminated) {
-	        return
-	      }
-
-	      this.#terminated = true;
-	      this.#cleanupDecompressors();
-	      super.onResponseEnd(controller, this.#trailers);
-	    });
+	    decompressor.on('end', () => this.#onDecompressionEnd());
 	  }
 
 	  /**
 	   * Sets up event handling for multiple chained decompressors using pipeline
-	   * @param {Controller} controller - The controller to handle events
 	   * @returns {void}
 	   */
-	  #setupMultipleDecompressors (controller) {
+	  #setupMultipleDecompressors () {
 	    const lastDecompressor = this.#decompressors[this.#decompressors.length - 1];
-	    this.#setupDecompressorEvents(lastDecompressor, controller);
+	    this.#setupDecompressorEvents(lastDecompressor);
 
 	    pipeline(this.#decompressors, (err) => {
 	      if (this.#terminated) {
@@ -60429,13 +61581,26 @@ function requireDecompress () {
 	      }
 
 	      if (err) {
-	        this.#fail(controller, err);
+	        this.#fail(err);
 	        return
 	      }
 
-	      this.#terminated = true;
-	      this.#cleanupDecompressors();
-	      super.onResponseEnd(controller, this.#trailers);
+	      this.#onDecompressionEnd();
+	    });
+	  }
+
+	  #setupInputBackpressure () {
+	    const decompressor = this.#decompressors[0];
+	    decompressor.on('drain', () => {
+	      if (this.#terminated) {
+	        return
+	      }
+
+	      this.#inputBackpressured = false;
+	      if (!this.#controller.paused) {
+	        this.#drainOutput();
+	        this.#resumeUpstreamIfNeeded();
+	      }
 	    });
 	  }
 
@@ -60445,6 +61610,16 @@ function requireDecompress () {
 	   */
 	  #cleanupDecompressors () {
 	    this.#decompressors.length = 0;
+	    this.#finalDecompressor = undefined;
+	  }
+
+	  onRequestStart (controller, context) {
+	    this.#controller.target = controller;
+	    return super.onRequestStart(this.#controller, context)
+	  }
+
+	  onRequestUpgrade (controller, statusCode, headers, socket) {
+	    return super.onRequestUpgrade(this.#controller, statusCode, headers, socket)
 	  }
 
 	  /**
@@ -60455,18 +61630,24 @@ function requireDecompress () {
 	   * @returns {void}
 	   */
 	  onResponseStart (controller, statusCode, headers, statusMessage) {
-	    const contentEncoding = headers['content-encoding'];
+	    // Repeated field lines reach us as an array. RFC 9110 section 5.3 lets a
+	    // recipient join them with commas, which yields the single-line form the
+	    // decompression chain already handles.
+	    const rawContentEncoding = headers['content-encoding'];
+	    const contentEncoding = Array.isArray(rawContentEncoding)
+	      ? rawContentEncoding.join(',')
+	      : rawContentEncoding;
 
 	    // If content encoding is not supported or status code is in skip list
 	    if (this.#shouldSkipDecompression(contentEncoding, statusCode)) {
-	      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+	      return super.onResponseStart(this.#controller, statusCode, headers, statusMessage)
 	    }
 
 	    const decompressors = this.#createDecompressionChain(contentEncoding.toLowerCase());
 
 	    if (decompressors.length === 0) {
 	      this.#cleanupDecompressors();
-	      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+	      return super.onResponseStart(this.#controller, statusCode, headers, statusMessage)
 	    }
 
 	    this.#decompressors = decompressors;
@@ -60474,8 +61655,8 @@ function requireDecompress () {
 	    // Remove compression headers since we're decompressing
 	    const { 'content-encoding': _, 'content-length': __, ...newHeaders } = headers;
 
-	    if (controller?.rawHeaders) {
-	      const rawHeaders = controller.rawHeaders;
+	    if (this.#controller.rawHeaders) {
+	      const rawHeaders = this.#controller.rawHeaders;
 
 	      if (Array.isArray(rawHeaders)) {
 	        const filteredHeaders = [];
@@ -60501,13 +61682,14 @@ function requireDecompress () {
 	      }
 	    }
 
+	    this.#setupInputBackpressure();
 	    if (this.#decompressors.length === 1) {
-	      this.#setupSingleDecompressor(controller);
+	      this.#setupSingleDecompressor();
 	    } else {
-	      this.#setupMultipleDecompressors(controller);
+	      this.#setupMultipleDecompressors();
 	    }
 
-	    return super.onResponseStart(controller, statusCode, newHeaders, statusMessage)
+	    return super.onResponseStart(this.#controller, statusCode, newHeaders, statusMessage)
 	  }
 
 	  /**
@@ -60517,10 +61699,13 @@ function requireDecompress () {
 	   */
 	  onResponseData (controller, chunk) {
 	    if (this.#decompressors.length > 0) {
-	      this.#decompressors[0].write(chunk);
+	      if (!this.#decompressors[0].write(chunk)) {
+	        this.#inputBackpressured = true;
+	        this.#pauseUpstream();
+	      }
 	      return
 	    }
-	    super.onResponseData(controller, chunk);
+	    return super.onResponseData(this.#controller, chunk)
 	  }
 
 	  /**
@@ -60535,7 +61720,7 @@ function requireDecompress () {
 	      this.#decompressors[0].end();
 	      return
 	    }
-	    super.onResponseEnd(controller, trailers);
+	    return super.onResponseEnd(this.#controller, trailers)
 	  }
 
 	  /**
@@ -60553,7 +61738,7 @@ function requireDecompress () {
 	      decompressor.destroy();
 	    }
 	    this.#cleanupDecompressors();
-	    super.onResponseError(controller, err);
+	    super.onResponseError(this.#controller, err);
 	  }
 	}
 
@@ -60607,6 +61792,7 @@ function requireDeduplicationHandler () {
 	 * @property {number} bufferedBytes
 	 * @property {object | null} pendingTrailers
 	 * @property {boolean} done
+	 * @property {boolean} [pendingStart] onRequestStart deferred until the primary request's context is known
 	 */
 
 	/**
@@ -60620,6 +61806,20 @@ function requireDeduplicationHandler () {
 	   * @type {DispatchHandler}
 	   */
 	  #primaryHandler
+
+	  /**
+	   * Whether the primary request has started (onRequestStart received). Until
+	   * then the request context is unknown and cannot be given to waiting handlers.
+	   * @type {boolean}
+	   */
+	  #requestStarted = false
+
+	  /**
+	   * The primary request context, replayed to waiting handlers so they observe
+	   * the same redirect history as the primary.
+	   * @type {any}
+	   */
+	  #context = null
 
 	  /**
 	   * @type {WaitingHandler[]}
@@ -60703,20 +61903,30 @@ function requireDeduplicationHandler () {
 	    const waitingController = waitingHandler.controller;
 
 	    try {
-	      handler.onRequestStart?.(waitingController, null);
+	      if (this.#requestStarted) {
+	        // The primary request has started, so its context (including the
+	        // redirect history) is known and can be delivered immediately.
+	        handler.onRequestStart?.(waitingController, this.#context);
 
-	      if (waitingController.aborted) {
-	        waitingHandler.done = true;
-	        return true
-	      }
+	        if (waitingController.aborted) {
+	          waitingHandler.done = true;
+	          return true
+	        }
 
-	      if (this.#responseStarted) {
-	        handler.onResponseStart?.(
-	          waitingController,
-	          this.#statusCode,
-	          this.#headers,
-	          this.#statusMessage
-	        );
+	        if (this.#responseStarted) {
+	          handler.onResponseStart?.(
+	            waitingController,
+	            this.#statusCode,
+	            this.#headers,
+	            this.#statusMessage
+	          );
+	        }
+	      } else {
+	        // The primary request has not started yet. Defer onRequestStart until
+	        // its context is known, so the waiting handler observes the same
+	        // redirect history as the primary (a cache handler relies on it to
+	        // reject cross-origin redirect responses).
+	        waitingHandler.pendingStart = true;
 	      }
 	    } catch {
 	      // Ignore errors from waiting handlers
@@ -60737,6 +61947,24 @@ function requireDeduplicationHandler () {
 	   */
 	  onRequestStart (controller, context) {
 	    this.#controller = controller;
+	    if (!this.#requestStarted) {
+	      this.#requestStarted = true;
+	      this.#context = context;
+	      // Deliver the now-known context to handlers that joined before the
+	      // primary request started.
+	      for (const waitingHandler of this.#waitingHandlers) {
+	        if (waitingHandler.pendingStart && !waitingHandler.done && !waitingHandler.controller.aborted) {
+	          waitingHandler.pendingStart = false;
+	          try {
+	            waitingHandler.handler.onRequestStart?.(waitingHandler.controller, context);
+	          } catch {
+	            // Ignore errors from waiting handlers
+	            waitingHandler.done = true;
+	          }
+	        }
+	      }
+	      this.#pruneDoneWaitingHandlers();
+	    }
 	    this.#primaryHandler.onRequestStart?.(controller, context);
 	  }
 
@@ -60910,7 +62138,8 @@ function requireDeduplicationHandler () {
 	      bufferedChunks: [],
 	      bufferedBytes: 0,
 	      pendingTrailers: null,
-	      done: false
+	      done: false,
+	      pendingStart: false
 	    };
 
 	    const state = {
@@ -61189,7 +62418,9 @@ function requireSqliteCacheStore () {
 
 	let DatabaseSync;
 
-	const VERSION = 3;
+	// Bump when entries written by an older cache policy are unsafe to reuse.
+	// Version 4 invalidates entries that may have been poisoned through redirects.
+	const VERSION = 4;
 
 	// 2gb
 	const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000;
@@ -64158,6 +65389,7 @@ function requireSubresourceIntegrity () {
 
 	const assert = require$$0$3;
 	const { runtimeFeatures } = requireRuntimeFeatures();
+	const { asciiLowercase } = requireInfra();
 
 	/**
 	 * @typedef {object} Metadata
@@ -64222,14 +65454,12 @@ function requireSubresourceIntegrity () {
 
 	/**
 	 * @typedef IsValidSRIHashAlgorithm
+	 * @see https://w3c.github.io/webappsec-subresource-integrity/#valid-sri-hash-algorithm-token
 	 * @type {(algorithm: string) => algorithm is SRIHashAlgorithm}
 	 * @param {*} algorithm
 	 * @returns {algorithm is SRIHashAlgorithm}
 	 */
-
-	const isValidSRIHashAlgorithm = /** @type {IsValidSRIHashAlgorithm} */ (
-	  Map.prototype.has.bind(validSRIHashAlgorithmTokenSet)
-	);
+	const isValidSRIHashAlgorithm = (algorithm) => validSRIHashAlgorithmTokenSet.has(asciiLowercase(algorithm));
 
 	/**
 	 * @param {Uint8Array} bytes
@@ -64354,8 +65584,8 @@ function requireSubresourceIntegrity () {
 	  /** @type {MetadataList} */
 	  const result = [];
 
-	  // 2. For each item returned by splitting metadata on spaces:
-	  for (const item of metadata.split(' ')) {
+	  // 2. For each item returned by splitting metadata on ASCII whitespace:
+	  for (const item of metadata.split(/[\t\n\f\r ]+/)) {
 	    // 1. Let expression-and-options be the result of splitting item on U+003F (?).
 	    const expressionAndOptions = item.split('?', 1);
 
@@ -64385,7 +65615,8 @@ function requireSubresourceIntegrity () {
 	    // 8. Let metadata be the ordered map
 	    // «["alg" → algorithm, "val" → base64-value]».
 	    const metadata = {
-	      alg: algorithm,
+	      // Possible spec bug?
+	      alg: asciiLowercase(algorithm),
 	      val: base64Value
 	    };
 
@@ -66628,8 +67859,6 @@ function requireFetch () {
 	          }
 	          const location = headersList.get('location', true);
 
-	          this.body = new Readable({ read: resume });
-
 	          const willFollow = location && request.redirect === 'follow' &&
 	            redirectStatusSet.has(status);
 
@@ -66647,7 +67876,7 @@ function requireFetch () {
 	            // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
 	            const maxContentEncodings = 5;
 	            if (codings.length > maxContentEncodings) {
-	              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
+	              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
 	              return true
 	            }
 
@@ -66684,6 +67913,8 @@ function requireFetch () {
 	              }
 	            }
 	          }
+
+	          this.body = new Readable({ read: resume });
 
 	          const onError = this.onError.bind(this);
 
@@ -68254,8 +69485,27 @@ function requireUtil$2 () {
 	    out.push(`Path=${cookie.path}`);
 	  }
 
-	  if (cookie.expires && cookie.expires.toString() !== 'Invalid Date') {
-	    out.push(`Expires=${toIMFDate(cookie.expires)}`);
+	  // A numeric 0 is the Unix epoch, not an absent value -- the same reason the
+	  // Max-Age check above tests the type rather than truthiness.
+	  //
+	  // expires is Date | number, so the "Invalid Date" check only guards the Date
+	  // form. A number that is not a valid time value (NaN, +/-Infinity, or outside
+	  // the Date range) would otherwise reach toIMFDate, which splices undefined and
+	  // NaN into the header value instead of failing.
+	  if (cookie.expires != null) {
+	    const expiresMs = cookie.expires instanceof Date
+	      ? cookie.expires.getTime()
+	      : cookie.expires;
+
+	    // The largest time value a Date can represent, in milliseconds, i.e.
+	    // 100,000,000 days either side of the epoch (ECMA-262 Date Time Values).
+	    // Anything within it is safe for toIMFDate to format; anything beyond it
+	    // produces an invalid Date and must be ignored instead.
+	    const maxTimeValue = 8640000000000000;
+
+	    if (typeof expiresMs === 'number' && Number.isFinite(expiresMs) && Math.abs(expiresMs) <= maxTimeValue) {
+	      out.push(`Expires=${toIMFDate(cookie.expires)}`);
+	    }
 	  }
 
 	  if (cookie.sameSite) {
@@ -68391,220 +69641,221 @@ function requireParse () {
 	 * @param {Object.<string, unknown>} [cookieAttributeList={}]
 	 */
 	function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) {
-	  // 1. If the unparsed-attributes string is empty, skip the rest of
-	  //    these steps.
-	  if (unparsedAttributes.length === 0) {
-	    return cookieAttributeList
-	  }
+	  while (true) {
+	    // 1. If the unparsed-attributes string is empty, skip the rest of
+	    //    these steps.
+	    if (unparsedAttributes.length === 0) {
+	      return cookieAttributeList
+	    }
 
-	  // 2. Discard the first character of the unparsed-attributes (which
-	  //    will be a %x3B (";") character).
-	  assert(unparsedAttributes[0] === ';');
-	  unparsedAttributes = unparsedAttributes.slice(1);
+	    // 2. Discard the first character of the unparsed-attributes (which
+	    //    will be a %x3B (";") character).
+	    assert(unparsedAttributes[0] === ';');
+	    unparsedAttributes = unparsedAttributes.slice(1);
 
-	  let cookieAv = '';
+	    let cookieAv = '';
 
-	  // 3. If the remaining unparsed-attributes contains a %x3B (";")
-	  //    character:
-	  if (unparsedAttributes.includes(';')) {
+	    // 3. If the remaining unparsed-attributes contains a %x3B (";")
+	    //    character:
+	    if (unparsedAttributes.includes(';')) {
 	    // 1. Consume the characters of the unparsed-attributes up to, but
 	    //    not including, the first %x3B (";") character.
-	    cookieAv = collectASequenceOfCodePointsFast(
-	      ';',
-	      unparsedAttributes,
-	      { position: 0 }
-	    );
-	    unparsedAttributes = unparsedAttributes.slice(cookieAv.length);
-	  } else {
+	      cookieAv = collectASequenceOfCodePointsFast(
+	        ';',
+	        unparsedAttributes,
+	        { position: 0 }
+	      );
+	      unparsedAttributes = unparsedAttributes.slice(cookieAv.length);
+	    } else {
 	    // Otherwise:
 
-	    // 1. Consume the remainder of the unparsed-attributes.
-	    cookieAv = unparsedAttributes;
-	    unparsedAttributes = '';
-	  }
+	      // 1. Consume the remainder of the unparsed-attributes.
+	      cookieAv = unparsedAttributes;
+	      unparsedAttributes = '';
+	    }
 
-	  // Let the cookie-av string be the characters consumed in this step.
+	    // Let the cookie-av string be the characters consumed in this step.
 
-	  let attributeName = '';
-	  let attributeValue = '';
+	    let attributeName = '';
+	    let attributeValue = '';
 
-	  // 4. If the cookie-av string contains a %x3D ("=") character:
-	  if (cookieAv.includes('=')) {
+	    // 4. If the cookie-av string contains a %x3D ("=") character:
+	    if (cookieAv.includes('=')) {
 	    // 1. The (possibly empty) attribute-name string consists of the
 	    //    characters up to, but not including, the first %x3D ("=")
 	    //    character, and the (possibly empty) attribute-value string
 	    //    consists of the characters after the first %x3D ("=")
 	    //    character.
-	    const position = { position: 0 };
+	      const position = { position: 0 };
 
-	    attributeName = collectASequenceOfCodePointsFast(
-	      '=',
-	      cookieAv,
-	      position
-	    );
-	    attributeValue = cookieAv.slice(position.position + 1);
-	  } else {
+	      attributeName = collectASequenceOfCodePointsFast(
+	        '=',
+	        cookieAv,
+	        position
+	      );
+	      attributeValue = cookieAv.slice(position.position + 1);
+	    } else {
 	    // Otherwise:
 
-	    // 1. The attribute-name string consists of the entire cookie-av
-	    //    string, and the attribute-value string is empty.
-	    attributeName = cookieAv;
-	  }
+	      // 1. The attribute-name string consists of the entire cookie-av
+	      //    string, and the attribute-value string is empty.
+	      attributeName = cookieAv;
+	    }
 
-	  // 5. Remove any leading or trailing WSP characters from the attribute-
-	  //    name string and the attribute-value string.
-	  attributeName = attributeName.trim();
-	  attributeValue = attributeValue.trim();
+	    // 5. Remove any leading or trailing WSP characters from the attribute-
+	    //    name string and the attribute-value string.
+	    attributeName = attributeName.trim();
+	    attributeValue = attributeValue.trim();
 
-	  // 6. If the attribute-value is longer than 1024 octets, ignore the
-	  //    cookie-av string and return to Step 1 of this algorithm.
-	  if (attributeValue.length > maxAttributeValueSize) {
-	    return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-	  }
+	    // 6. If the attribute-value is longer than 1024 octets, ignore the
+	    //    cookie-av string and return to Step 1 of this algorithm.
+	    if (attributeValue.length > maxAttributeValueSize) {
+	      continue
+	    }
 
-	  // 7. Process the attribute-name and attribute-value according to the
-	  //    requirements in the following subsections.  (Notice that
-	  //    attributes with unrecognized attribute-names are ignored.)
-	  const attributeNameLowercase = attributeName.toLowerCase();
+	    // 7. Process the attribute-name and attribute-value according to the
+	    //    requirements in the following subsections.  (Notice that
+	    //    attributes with unrecognized attribute-names are ignored.)
+	    const attributeNameLowercase = attributeName.toLowerCase();
 
-	  // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.1
-	  // If the attribute-name case-insensitively matches the string
-	  // "Expires", the user agent MUST process the cookie-av as follows.
-	  if (attributeNameLowercase === 'expires') {
+	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.1
+	    // If the attribute-name case-insensitively matches the string
+	    // "Expires", the user agent MUST process the cookie-av as follows.
+	    if (attributeNameLowercase === 'expires') {
 	    // 1. Let the expiry-time be the result of parsing the attribute-value
 	    //    as cookie-date (see Section 5.1.1).
-	    const expiryTime = new Date(attributeValue);
+	      const expiryTime = new Date(attributeValue);
 
-	    // 2. If the attribute-value failed to parse as a cookie date, ignore
-	    //    the cookie-av.
+	      // 2. If the attribute-value failed to parse as a cookie date, ignore
+	      //    the cookie-av.
 
-	    cookieAttributeList.expires = expiryTime;
-	  } else if (attributeNameLowercase === 'max-age') {
+	      cookieAttributeList.expires = expiryTime;
+	    } else if (attributeNameLowercase === 'max-age') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.2
 	    // If the attribute-name case-insensitively matches the string "Max-
 	    // Age", the user agent MUST process the cookie-av as follows.
 
-	    // 1. If the first character of the attribute-value is not a DIGIT or a
-	    //    "-" character, ignore the cookie-av.
-	    const charCode = attributeValue.charCodeAt(0);
+	      // 1. If the first character of the attribute-value is not a DIGIT or a
+	      //    "-" character, ignore the cookie-av.
+	      const charCode = attributeValue.charCodeAt(0);
 
-	    if ((charCode < 48 || charCode > 57) && attributeValue[0] !== '-') {
-	      return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-	    }
+	      if ((charCode < 48 || charCode > 57) && attributeValue[0] !== '-') {
+	        continue
+	      }
 
-	    // 2. If the remainder of attribute-value contains a non-DIGIT
-	    //    character, ignore the cookie-av.
-	    if (!/^\d+$/.test(attributeValue)) {
-	      return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-	    }
+	      // 2. If the remainder of attribute-value contains a non-DIGIT
+	      //    character, ignore the cookie-av.
+	      if (!/^\d+$/.test(attributeValue)) {
+	        continue
+	      }
 
-	    // 3. Let delta-seconds be the attribute-value converted to an integer.
-	    const deltaSeconds = Number(attributeValue);
+	      // 3. Let delta-seconds be the attribute-value converted to an integer.
+	      const deltaSeconds = Number(attributeValue);
 
-	    // 4. Let cookie-age-limit be the maximum age of the cookie (which
-	    //    SHOULD be 400 days or less, see Section 4.1.2.2).
+	      // 4. Let cookie-age-limit be the maximum age of the cookie (which
+	      //    SHOULD be 400 days or less, see Section 4.1.2.2).
 
-	    // 5. Set delta-seconds to the smaller of its present value and cookie-
-	    //    age-limit.
-	    // deltaSeconds = Math.min(deltaSeconds * 1000, maxExpiresMs)
+	      // 5. Set delta-seconds to the smaller of its present value and cookie-
+	      //    age-limit.
+	      // deltaSeconds = Math.min(deltaSeconds * 1000, maxExpiresMs)
 
-	    // 6. If delta-seconds is less than or equal to zero (0), let expiry-
-	    //    time be the earliest representable date and time.  Otherwise, let
-	    //    the expiry-time be the current date and time plus delta-seconds
-	    //    seconds.
-	    // const expiryTime = deltaSeconds <= 0 ? Date.now() : Date.now() + deltaSeconds
+	      // 6. If delta-seconds is less than or equal to zero (0), let expiry-
+	      //    time be the earliest representable date and time.  Otherwise, let
+	      //    the expiry-time be the current date and time plus delta-seconds
+	      //    seconds.
+	      // const expiryTime = deltaSeconds <= 0 ? Date.now() : Date.now() + deltaSeconds
 
-	    // 7. Append an attribute to the cookie-attribute-list with an
-	    //    attribute-name of Max-Age and an attribute-value of expiry-time.
-	    cookieAttributeList.maxAge = deltaSeconds;
-	  } else if (attributeNameLowercase === 'domain') {
+	      // 7. Append an attribute to the cookie-attribute-list with an
+	      //    attribute-name of Max-Age and an attribute-value of expiry-time.
+	      cookieAttributeList.maxAge = deltaSeconds;
+	    } else if (attributeNameLowercase === 'domain') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.3
 	    // If the attribute-name case-insensitively matches the string "Domain",
 	    // the user agent MUST process the cookie-av as follows.
 
-	    // 1. Let cookie-domain be the attribute-value.
-	    let cookieDomain = attributeValue;
+	      // 1. Let cookie-domain be the attribute-value.
+	      let cookieDomain = attributeValue;
 
-	    // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be
-	    //    cookie-domain without its leading %x2E (".").
-	    if (cookieDomain[0] === '.') {
-	      cookieDomain = cookieDomain.slice(1);
-	    }
+	      // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be
+	      //    cookie-domain without its leading %x2E (".").
+	      if (cookieDomain[0] === '.') {
+	        cookieDomain = cookieDomain.slice(1);
+	      }
 
-	    // 3. Convert the cookie-domain to lower case.
-	    cookieDomain = cookieDomain.toLowerCase();
+	      // 3. Convert the cookie-domain to lower case.
+	      cookieDomain = cookieDomain.toLowerCase();
 
-	    // 4. Append an attribute to the cookie-attribute-list with an
-	    //    attribute-name of Domain and an attribute-value of cookie-domain.
-	    cookieAttributeList.domain = cookieDomain;
-	  } else if (attributeNameLowercase === 'path') {
+	      // 4. Append an attribute to the cookie-attribute-list with an
+	      //    attribute-name of Domain and an attribute-value of cookie-domain.
+	      cookieAttributeList.domain = cookieDomain;
+	    } else if (attributeNameLowercase === 'path') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.4
 	    // If the attribute-name case-insensitively matches the string "Path",
 	    // the user agent MUST process the cookie-av as follows.
 
-	    // 1. If the attribute-value is empty or if the first character of the
-	    //    attribute-value is not %x2F ("/"):
-	    let cookiePath = '';
-	    if (attributeValue.length === 0 || attributeValue[0] !== '/') {
+	      // 1. If the attribute-value is empty or if the first character of the
+	      //    attribute-value is not %x2F ("/"):
+	      let cookiePath = '';
+	      if (attributeValue.length === 0 || attributeValue[0] !== '/') {
 	      // 1. Let cookie-path be the default-path.
-	      cookiePath = '/';
-	    } else {
+	        cookiePath = '/';
+	      } else {
 	      // Otherwise:
 
-	      // 1. Let cookie-path be the attribute-value.
-	      cookiePath = attributeValue;
-	    }
+	        // 1. Let cookie-path be the attribute-value.
+	        cookiePath = attributeValue;
+	      }
 
-	    // 2. Append an attribute to the cookie-attribute-list with an
-	    //    attribute-name of Path and an attribute-value of cookie-path.
-	    cookieAttributeList.path = cookiePath;
-	  } else if (attributeNameLowercase === 'secure') {
+	      // 2. Append an attribute to the cookie-attribute-list with an
+	      //    attribute-name of Path and an attribute-value of cookie-path.
+	      cookieAttributeList.path = cookiePath;
+	    } else if (attributeNameLowercase === 'secure') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.5
 	    // If the attribute-name case-insensitively matches the string "Secure",
 	    // the user agent MUST append an attribute to the cookie-attribute-list
 	    // with an attribute-name of Secure and an empty attribute-value.
 
-	    cookieAttributeList.secure = true;
-	  } else if (attributeNameLowercase === 'httponly') {
+	      cookieAttributeList.secure = true;
+	    } else if (attributeNameLowercase === 'httponly') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.6
 	    // If the attribute-name case-insensitively matches the string
 	    // "HttpOnly", the user agent MUST append an attribute to the cookie-
 	    // attribute-list with an attribute-name of HttpOnly and an empty
 	    // attribute-value.
 
-	    cookieAttributeList.httpOnly = true;
-	  } else if (attributeNameLowercase === 'samesite') {
+	      cookieAttributeList.httpOnly = true;
+	    } else if (attributeNameLowercase === 'samesite') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.7
 	    // If the attribute-name case-insensitively matches the string
 	    // "SameSite", the user agent MUST process the cookie-av as follows:
 
-	    const attributeValueLowercase = attributeValue.toLowerCase();
+	      const attributeValueLowercase = attributeValue.toLowerCase();
 
-	    // 1. If cookie-av's attribute-value is a case-insensitive match for
-	    //    "None", append an attribute to the cookie-attribute-list with an
-	    //    attribute-name of "SameSite" and an attribute-value of "None".
-	    if (attributeValueLowercase === 'none') {
-	      cookieAttributeList.sameSite = 'None';
-	    } else if (attributeValueLowercase === 'strict') {
+	      // 1. If cookie-av's attribute-value is a case-insensitive match for
+	      //    "None", append an attribute to the cookie-attribute-list with an
+	      //    attribute-name of "SameSite" and an attribute-value of "None".
+	      if (attributeValueLowercase === 'none') {
+	        cookieAttributeList.sameSite = 'None';
+	      } else if (attributeValueLowercase === 'strict') {
 	      // 2. If cookie-av's attribute-value is a case-insensitive match for
 	      //    "Strict", append an attribute to the cookie-attribute-list with
 	      //    an attribute-name of "SameSite" and an attribute-value of
 	      //    "Strict".
-	      cookieAttributeList.sameSite = 'Strict';
-	    } else if (attributeValueLowercase === 'lax') {
+	        cookieAttributeList.sameSite = 'Strict';
+	      } else if (attributeValueLowercase === 'lax') {
 	      // 3. If cookie-av's attribute-value is a case-insensitive match for
 	      //    "Lax", append an attribute to the cookie-attribute-list with an
 	      //    attribute-name of "SameSite" and an attribute-value of "Lax".
-	      cookieAttributeList.sameSite = 'Lax';
-	    }
-	  } else {
-	    cookieAttributeList.unparsed ??= [];
+	        cookieAttributeList.sameSite = 'Lax';
+	      }
+	    } else {
+	      cookieAttributeList.unparsed ??= [];
 
-	    cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`);
-	  }
+	      cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`);
+	    }
 
 	  // 8. Return to Step 1 of this algorithm.
-	  return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
+	  }
 	}
 
 	parse = {
@@ -68653,8 +69904,10 @@ function requireCookies () {
 
 	  const cookie = headers.get('cookie');
 
+	  // A null prototype keeps a cookie named `__proto__` from hitting the
+	  // Object.prototype setter, which would silently drop it.
 	  /** @type {Record<string, string>} */
-	  const out = {};
+	  const out = { __proto__: null };
 
 	  if (!cookie) {
 	    return out
@@ -69898,13 +71151,13 @@ function requireConnection () {
 	        // The presence of a session property on the socket indicates HTTP2
 	        // HTTP1
 	        if (response.socket?.session == null) {
-	          failWebsocketConnection(handler, 1002, 'Received network error or non-101 status code.', response.error);
+	          failHandshake(handler, response, 1002, 'Received network error or non-101 status code.', response.error);
 	          return
 	        }
 
 	        // HTTP2
 	        if (response.status !== 200) {
-	          failWebsocketConnection(handler, 1002, 'Received network error or non-200 status code.', response.error);
+	          failHandshake(handler, response, 1002, 'Received network error or non-200 status code.', response.error);
 	          return
 	        }
 	      }
@@ -69919,7 +71172,7 @@ function requireConnection () {
 	      //    header list results in null, failure, or the empty byte
 	      //    sequence, then fail the WebSocket connection.
 	      if (protocols.length !== 0 && !response.headersList.get('Sec-WebSocket-Protocol')) {
-	        failWebsocketConnection(handler, 1002, 'Server did not respond with sent protocols.');
+	        failHandshake(handler, response, 1002, 'Server did not respond with sent protocols.');
 	        return
 	      }
 
@@ -69935,7 +71188,7 @@ function requireConnection () {
 	      //    _Fail the WebSocket Connection_.
 	      //    For H2, no upgrade header is expected.
 	      if (response.socket.session == null && response.headersList.get('Upgrade')?.toLowerCase() !== 'websocket') {
-	        failWebsocketConnection(handler, 1002, 'Server did not set Upgrade header to "websocket".');
+	        failHandshake(handler, response, 1002, 'Server did not set Upgrade header to "websocket".');
 	        return
 	      }
 
@@ -69945,7 +71198,7 @@ function requireConnection () {
 	      //    MUST _Fail the WebSocket Connection_.
 	      //    For H2, no connection header is expected.
 	      if (response.socket.session == null && response.headersList.get('Connection')?.toLowerCase() !== 'upgrade') {
-	        failWebsocketConnection(handler, 1002, 'Server did not set Connection header to "upgrade".');
+	        failHandshake(handler, response, 1002, 'Server did not set Connection header to "upgrade".');
 	        return
 	      }
 
@@ -69959,7 +71212,7 @@ function requireConnection () {
 	      const secWSAccept = response.headersList.get('Sec-WebSocket-Accept');
 	      const digest = crypto.hash('sha1', keyValue + uid, 'base64');
 	      if (secWSAccept !== digest) {
-	        failWebsocketConnection(handler, 1002, 'Incorrect hash received in Sec-WebSocket-Accept header.');
+	        failHandshake(handler, response, 1002, 'Incorrect hash received in Sec-WebSocket-Accept header.');
 	        return
 	      }
 
@@ -69977,7 +71230,7 @@ function requireConnection () {
 	        extensions = parseExtensions(secExtension);
 
 	        if (!extensions.has('permessage-deflate')) {
-	          failWebsocketConnection(handler, 1002, 'Sec-WebSocket-Extensions header does not match.');
+	          failHandshake(handler, response, 1002, 'Sec-WebSocket-Extensions header does not match.');
 	          return
 	        }
 	      }
@@ -69998,7 +71251,7 @@ function requireConnection () {
 	        // the selected subprotocol values in its response for the connection to
 	        // be established.
 	        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
-	          failWebsocketConnection(handler, 1002, 'Protocol was not set in the opening handshake.');
+	          failHandshake(handler, response, 1002, 'Protocol was not set in the opening handshake.');
 	          return
 	        }
 	      }
@@ -70089,6 +71342,16 @@ function requireConnection () {
 	    // Set object’s ready state to CLOSING (2).
 	    object.readyState = states.CLOSING;
 	  }
+	}
+
+	function failHandshake (handler, response, code, reason, cause) {
+	  // The H2 upgrade request has already completed and handed off its stream.
+	  // Aborting the request cannot close that stream after handshake validation fails.
+	  if (response.socket?.session != null && !response.socket.destroyed) {
+	    response.socket.destroy();
+	  }
+
+	  failWebsocketConnection(handler, code, reason);
 	}
 
 	/**
@@ -70489,6 +71752,19 @@ function requireReceiver () {
 	        if (isControlFrame(this.#info.opcode)) {
 	          this.#loop = this.parseControlFrame(body);
 	          this.#state = parserStates.INFO;
+
+	          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+	          // stop parsing and resume on drain so a PING flood cannot grow the
+	          // outbound queue without bound.
+	          if (this.#loop && this.#handler.socket.writableNeedDrain) {
+	            this.#loop = false;
+	            this.#handler.socket.once('drain', () => {
+	              if (this.destroyed) return
+	              this.#loop = true;
+	              this.run(callback);
+	            });
+	            return
+	          }
 	        } else {
 	          if (!this.#info.compressed) {
 	            if (!this.writeFragments(body)) {
@@ -72295,6 +73571,7 @@ var hasRequiredEventsourceStream;
 function requireEventsourceStream () {
 	if (hasRequiredEventsourceStream) return eventsourceStream;
 	hasRequiredEventsourceStream = 1;
+	const buffer = require$$0$1;
 	const { Transform } = require$$0$4;
 	const { isASCIINumber, isValidLastEventId } = requireUtil();
 
@@ -72319,10 +73596,18 @@ function requireEventsourceStream () {
 	 */
 	const SPACE = 0x20;
 
+	const defaultMaxEventSize = buffer.kStringMaxLength;
+
 	const DATA = Buffer.from('data');
 	const EVENT = Buffer.from('event');
 	const ID = Buffer.from('id');
 	const RETRY = Buffer.from('retry');
+
+	// Each data field creates a string node, and each unconsumed input chunk keeps
+	// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+	const minParserItems = 1024;
+	const maxParserItems = 131072;
+	const bytesPerParserItem = 128;
 
 	function isASCIINumberBytes (buffer, start) {
 	  if (start >= buffer.length) {
@@ -72360,6 +73645,12 @@ function requireEventsourceStream () {
 	  }
 
 	  return true
+	}
+
+	function createMaxEventSizeExceededError () {
+	  const error = new Error('EventSource message size exceeded');
+	  error.aborted = false;
+	  return error
 	}
 
 	/**
@@ -72410,6 +73701,13 @@ function requireEventsourceStream () {
 	  pos = 0
 	  lineChunkIndex = 0
 	  linePos = 0
+	  lineLength = 0
+	  eventSize = 0
+	  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+	  dataLineCount = 0
+	  maxEventSize
+	  maxDataLines
+	  maxBufferedChunks
 
 	  event = {
 	    data: undefined,
@@ -72421,6 +73719,7 @@ function requireEventsourceStream () {
 	  /**
 	   * @param {object} options
 	   * @param {boolean} [options.readableObjectMode]
+	   * @param {number} [options.maxEventSize]
 	   * @param {eventSourceSettings} [options.eventSourceSettings]
 	   * @param {(chunk: any, encoding?: BufferEncoding | undefined) => boolean} [options.push]
 	   */
@@ -72432,6 +73731,12 @@ function requireEventsourceStream () {
 	    super(options);
 
 	    this.state = options.eventSourceSettings || {};
+	    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize;
+	    const parserItemLimit = this.maxEventSize > 0
+	      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+	      : 0;
+	    this.maxDataLines = parserItemLimit;
+	    this.maxBufferedChunks = parserItemLimit;
 	    if (options.push) {
 	      this.push = options.push;
 	    }
@@ -72449,6 +73754,14 @@ function requireEventsourceStream () {
 	      return
 	    }
 
+	    // A leading line ending can immediately release the currently buffered
+	    // line, even when it uses the final allowed chunk slot.
+	    if (this.maxEventSize > 0 &&
+	        this.chunks.length >= this.maxBufferedChunks &&
+	        chunk[0] !== LF && chunk[0] !== CR) {
+	      callback(createMaxEventSizeExceededError());
+	      return
+	    }
 	    this.chunks.push(chunk);
 
 	    // Strip leading byte-order-mark if we opened the stream and started
@@ -72527,7 +73840,12 @@ function requireEventsourceStream () {
 
 	        // In any case, we can process the line as we reached an
 	        // end-of-line character
-	        this.parseLine(this.readLine(), this.event);
+	        try {
+	          this.parseLine(this.readLine(), this.event);
+	        } catch (error) {
+	          callback(error);
+	          return
+	        }
 	        this.consumeCurrentByte();
 	        // A line was processed and this could be the end of the event. We need
 	        // to check if the next line is empty to determine if the event is
@@ -72536,10 +73854,23 @@ function requireEventsourceStream () {
 	        continue
 	      }
 
+	      // readLine() is only called after CR or LF. Reject an unfinished line
+	      // before it can retain an unbounded number of decoded chunks. The seven
+	      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+	      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+	        callback(createMaxEventSizeExceededError());
+	        return
+	      }
 	      this.advanceCursor();
 	    }
 
 	    callback();
+	  }
+
+	  _destroy (error, callback) {
+	    this.chunks.length = 0;
+	    this.clearEvent();
+	    super._destroy(error, callback);
 	  }
 
 	  /**
@@ -72578,6 +73909,13 @@ function requireEventsourceStream () {
 	    }
 
 	    if (isFieldName(line, fieldLength, DATA)) {
+	      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+	        throw createMaxEventSizeExceededError()
+	      }
+	      const valueBytes = line.length - valueStart;
+	      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes;
+	      this.setEventFieldSize('data', dataSize);
+
 	      const value = line.toString('utf8', valueStart);
 
 	      if (event.data === undefined) {
@@ -72585,11 +73923,13 @@ function requireEventsourceStream () {
 	      } else {
 	        event.data += `\n${value}`;
 	      }
+	      this.dataLineCount++;
 	      return
 	    }
 
 	    if (isFieldName(line, fieldLength, RETRY)) {
 	      if (isASCIINumberBytes(line, valueStart)) {
+	        this.setEventFieldSize('retry', line.length - valueStart);
 	        event.retry = line.toString('utf8', valueStart);
 	      }
 	      return
@@ -72597,18 +73937,27 @@ function requireEventsourceStream () {
 
 	    if (isFieldName(line, fieldLength, ID)) {
 	      if (isValidLastEventIdBytes(line, valueStart)) {
+	        this.setEventFieldSize('id', line.length - valueStart);
 	        event.id = line.toString('utf8', valueStart);
 	      }
 	      return
 	    }
 
 	    if (isFieldName(line, fieldLength, EVENT)) {
-	      const value = line.toString('utf8', valueStart);
-
-	      if (value.length > 0) {
-	        event.event = value;
+	      if (valueStart < line.length) {
+	        this.setEventFieldSize('event', line.length - valueStart);
+	        event.event = line.toString('utf8', valueStart);
 	      }
 	    }
+	  }
+
+	  setEventFieldSize (field, size) {
+	    const eventSize = this.eventSize - this.eventFieldSizes[field] + size;
+	    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+	      throw createMaxEventSizeExceededError()
+	    }
+	    this.eventSize = eventSize;
+	    this.eventFieldSizes[field] = size;
 	  }
 
 	  /**
@@ -72641,6 +73990,12 @@ function requireEventsourceStream () {
 	    this.event.event = undefined;
 	    this.event.id = undefined;
 	    this.event.retry = undefined;
+	    this.eventSize = 0;
+	    this.dataLineCount = 0;
+	    this.eventFieldSizes.data = 0;
+	    this.eventFieldSizes.event = 0;
+	    this.eventFieldSizes.id = 0;
+	    this.eventFieldSizes.retry = 0;
 	  }
 
 	  hasPendingEvent () {
@@ -72676,14 +74031,16 @@ function requireEventsourceStream () {
 	  syncLineStartToCursor () {
 	    this.lineChunkIndex = this.chunkIndex;
 	    this.linePos = this.pos;
+	    this.lineLength = 0;
 	    this.dropConsumedChunks();
 	  }
 
 	  dropConsumedChunks () {
-	    while (this.lineChunkIndex > 0) {
-	      this.chunks.shift();
-	      this.lineChunkIndex--;
-	      this.chunkIndex--;
+	    if (this.lineChunkIndex > 0) {
+	      const consumed = this.lineChunkIndex;
+	      this.chunks.splice(0, consumed);
+	      this.lineChunkIndex = 0;
+	      this.chunkIndex -= consumed;
 	    }
 
 	    if (this.chunkIndex === this.chunks.length) {
@@ -72808,6 +74165,7 @@ function requireEventsource () {
 	const { isNetworkError } = requireResponse();
 	const { kEnumerableProperty } = requireUtil$5();
 	const { environmentSettingsObject } = requireUtil$4();
+	const { getGlobalDispatcher } = requireGlobal();
 
 	let experimentalWarned = false;
 
@@ -73090,6 +74448,7 @@ function requireEventsource () {
 
 	      const eventSourceStream = new EventSourceStream({
 	        eventSourceSettings: this.#state,
+	        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
 	        push: (event) => {
 	          this.dispatchEvent(createFastMessageEvent(
 	            event.type,
@@ -73274,7 +74633,8 @@ function requireEventsource () {
 	  },
 	  {
 	    key: 'dispatcher', // undici only
-	    converter: webidl.converters.any
+	    converter: webidl.converters.any,
+	    defaultValue: () => getGlobalDispatcher()
 	  },
 	  {
 	    key: 'node', // undici only
@@ -92078,7 +93438,16 @@ function requireFollowRedirects () {
 	  if (!options.headers) {
 	    options.headers = {};
 	  }
-	  if (!isArray(options.sensitiveHeaders)) {
+	  // Convert [header1, value1, header2, value2, …] to object
+	  else if (Array.isArray(options.headers)) {
+	    var headerList = options.headers;
+	    options.headers = {};
+	    for (var i = 0; i < headerList.length; i += 2) {
+	      options.headers[headerList[i]] = headerList[i + 1];
+	    }
+	  }
+	  // Ensure sensitive headers are always present
+	  if (!Array.isArray(options.sensitiveHeaders)) {
 	    options.sensitiveHeaders = [];
 	  }
 
@@ -92456,10 +93825,6 @@ function requireFollowRedirects () {
 	  return dot > 0 && subdomain[dot] === "." && subdomain.endsWith(domain);
 	}
 
-	function isArray(value) {
-	  return value instanceof Array;
-	}
-
 	function isString(value) {
 	  return typeof value === "string" || value instanceof String;
 	}
@@ -92477,7 +93842,8 @@ function requireFollowRedirects () {
 	}
 
 	function escapeRegex(regex) {
-	  return regex.replace(/[\]\\/()*+?.$]/g, "\\$&");
+	  // As per https://tc39.es/proposal-regexp-modifiers/#prod-SyntaxCharacter
+	  return regex.replace(/[\^$\\.*+?()[\]{}|]/g, "\\$&");
 	}
 
 	// Exports
